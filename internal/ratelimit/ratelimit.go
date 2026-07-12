@@ -49,6 +49,10 @@ type Config struct {
 	IPReqPerSecond float64
 	IPReqPerMinute float64
 	IPBurst        int
+	// Per-user limit for authenticated non-API-key sessions (browser JWT,
+	// plugin access tokens). Keyed by user id, so all of an account's tabs,
+	// devices, and household profiles share one bucket.
+	Session TierConfig
 	// Auth endpoint per-IP limits
 	AuthEndpoints map[string]AuthEndpointConfig
 }
@@ -65,6 +69,11 @@ func DefaultConfig() Config {
 		IPReqPerSecond: 120,
 		IPReqPerMinute: 6000,
 		IPBurst:        120,
+		// Generous on purpose: household profiles share one user_id, the home
+		// page fires many parallel section requests, and TV clients burst on
+		// library browse. This is a guardrail against runaway request loops,
+		// not a throttle on humans.
+		Session: TierConfig{RequestsPerSecond: 30, RequestsPerMinute: 600, Burst: 60},
 		AuthEndpoints: map[string]AuthEndpointConfig{
 			"login":         {RequestsPerMinute: 20, Burst: 10},
 			"signup":        {RequestsPerMinute: 10, Burst: 6},

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/Silo-Server/silo-server/internal/auth"
@@ -119,7 +120,8 @@ func (mw *Middleware) Handler(next http.Handler) http.Handler {
 
 		// Check per-key limiter (API key auth only)
 		claims := apimw.GetClaims(r.Context())
-		if claims != nil && claims.TokenType == auth.TokenTypeAPIKey && claims.APIKeyID != 0 {
+		switch {
+		case claims != nil && claims.TokenType == auth.TokenTypeAPIKey && claims.APIKeyID != 0:
 			// RateTier is already on the claims — no DB lookup needed
 			tier := claims.RateTier
 			if tier == "" {
@@ -149,10 +151,47 @@ func (mw *Middleware) Handler(next http.Handler) http.Handler {
 				writeRateLimitResponse(w, result)
 				return
 			}
+		case claims != nil && claims.UserID != 0:
+			// Per-user limit for authenticated non-API-key sessions (browser
+			// JWT, plugin access tokens). Keyed by user id — SessionID can be
+			// empty for some token types, and a user key also bounds
+			// multi-tab/multi-device abuse per account. No X-RateLimit-*
+			// headers on allowed responses; that contract stays API-key-only.
+			if isSessionLimitExemptPath(r.URL.Path) {
+				break
+			}
+			sessionRate := Rate{
+				RequestsPerSecond: cfg.Session.RequestsPerSecond,
+				RequestsPerMinute: cfg.Session.RequestsPerMinute,
+				Burst:             cfg.Session.Burst,
+			}
+			result := mw.perKey.Allow(r.Context(), "user:"+strconv.Itoa(claims.UserID), sessionRate)
+			if !result.Allowed {
+				writeRateLimitResponse(w, result)
+				return
+			}
 		}
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+// sessionLimitExemptPrefixes lists playback-critical routes that skip the
+// per-user session limit (global and per-IP limits still apply). HLS segment
+// fetches and seek bursts are legitimate high-rate traffic, and a 429 there
+// stalls playback; these routes are already gated by per-session UUIDs.
+var sessionLimitExemptPrefixes = []string{
+	"/api/v1/playback/transcode/", // HLS manifests + segments
+	"/api/v1/stream/",             // direct stream, subtitles, fonts
+}
+
+func isSessionLimitExemptPath(path string) bool {
+	for _, prefix := range sessionLimitExemptPrefixes {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 type rateLimitError struct {

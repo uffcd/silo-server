@@ -41,6 +41,9 @@ const DEFAULT_CONFIG: RateLimitConfig = {
   ip_requests_per_second: 120,
   ip_requests_per_minute: 6000,
   ip_burst: 120,
+  session_requests_per_second: 30,
+  session_requests_per_minute: 600,
+  session_burst: 60,
   auth_endpoints: {
     login: { requests_per_minute: 20, burst: 10 },
     signup: { requests_per_minute: 10, burst: 6 },
@@ -77,6 +80,11 @@ export default function RateLimitSettings() {
       ip_requests_per_minute:
         serverConfig.ip_requests_per_minute ?? DEFAULT_CONFIG.ip_requests_per_minute,
       ip_burst: serverConfig.ip_burst ?? DEFAULT_CONFIG.ip_burst,
+      session_requests_per_second:
+        serverConfig.session_requests_per_second ?? DEFAULT_CONFIG.session_requests_per_second,
+      session_requests_per_minute:
+        serverConfig.session_requests_per_minute ?? DEFAULT_CONFIG.session_requests_per_minute,
+      session_burst: serverConfig.session_burst ?? DEFAULT_CONFIG.session_burst,
       auth_endpoints: {
         login: serverConfig.auth_endpoints?.login ?? DEFAULT_CONFIG.auth_endpoints.login!,
         signup: serverConfig.auth_endpoints?.signup ?? DEFAULT_CONFIG.auth_endpoints.signup!,
@@ -300,6 +308,71 @@ export default function RateLimitSettings() {
                   const num = parseInt(e.target.value, 10);
                   if (!isNaN(num) && num > 0) {
                     updateConfigState((prev) => ({ ...prev, ip_burst: num }));
+                  }
+                }}
+                className="w-full"
+              />
+            </div>
+          </div>
+        </div>
+
+        <div className="surface-panel rounded-2xl border-0 px-5 py-4">
+          <div className="mb-1 text-sm font-semibold">Per-User Session Limits</div>
+          <p className="text-muted-foreground mb-3 text-xs">
+            Applied per user account to browser and app sessions (not API keys). All profiles, tabs,
+            and devices on one account share the bucket; playback streaming routes are exempt. A
+            guardrail against runaway request loops, not a throttle on normal browsing.
+          </p>
+          <div className="grid gap-4 sm:grid-cols-3">
+            <div className="space-y-1">
+              <Label htmlFor="session-rps" className="text-sm font-medium">
+                Requests / Second
+              </Label>
+              <Input
+                id="session-rps"
+                type="number"
+                min={1}
+                value={config.session_requests_per_second}
+                onChange={(e) => {
+                  const num = parseInt(e.target.value, 10);
+                  if (!isNaN(num) && num > 0) {
+                    updateConfigState((prev) => ({ ...prev, session_requests_per_second: num }));
+                  }
+                }}
+                className="w-full"
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="session-rpm" className="text-sm font-medium">
+                Requests / Minute
+              </Label>
+              <Input
+                id="session-rpm"
+                type="number"
+                min={1}
+                value={config.session_requests_per_minute}
+                onChange={(e) => {
+                  const num = parseInt(e.target.value, 10);
+                  if (!isNaN(num) && num > 0) {
+                    updateConfigState((prev) => ({ ...prev, session_requests_per_minute: num }));
+                  }
+                }}
+                className="w-full"
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="session-burst" className="text-sm font-medium">
+                Burst
+              </Label>
+              <Input
+                id="session-burst"
+                type="number"
+                min={1}
+                value={config.session_burst}
+                onChange={(e) => {
+                  const num = parseInt(e.target.value, 10);
+                  if (!isNaN(num) && num > 0) {
+                    updateConfigState((prev) => ({ ...prev, session_burst: num }));
                   }
                 }}
                 className="w-full"

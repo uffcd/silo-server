@@ -138,3 +138,34 @@ func TestRateLimitHandlerWithRunningLimiter(t *testing.T) {
 		t.Errorf("backend change: restart_required = %v, want true", resp["restart_required"])
 	}
 }
+
+func TestRateLimitHandlerSessionFieldsRoundTrip(t *testing.T) {
+	store := newFakeRateLimitStore()
+	mw := newRunningRateLimitMiddleware(t, store)
+	h := NewRateLimitHandler(store, mw, nil, NewServerRestartStatusTracker())
+
+	got := getRateLimitConfig(t, h)
+	defaults := ratelimit.DefaultConfig()
+	if got.SessionReqPerSec != defaults.Session.RequestsPerSecond ||
+		got.SessionReqPerMin != defaults.Session.RequestsPerMinute ||
+		got.SessionBurst != defaults.Session.Burst {
+		t.Errorf("GET session defaults = (%v, %v, %d), want (%v, %v, %d)",
+			got.SessionReqPerSec, got.SessionReqPerMin, got.SessionBurst,
+			defaults.Session.RequestsPerSecond, defaults.Session.RequestsPerMinute, defaults.Session.Burst)
+	}
+
+	putRateLimitConfig(t, h, `{"enabled":true,"backend":"memory","session_requests_per_second":12,"session_requests_per_minute":240,"session_burst":24}`)
+	got = getRateLimitConfig(t, h)
+	if got.SessionReqPerSec != 12 || got.SessionReqPerMin != 240 || got.SessionBurst != 24 {
+		t.Errorf("session after update = (%v, %v, %d), want (12, 240, 24)",
+			got.SessionReqPerSec, got.SessionReqPerMin, got.SessionBurst)
+	}
+
+	// Omitted session fields (zero values) preserve the stored settings.
+	putRateLimitConfig(t, h, `{"enabled":true,"backend":"memory"}`)
+	got = getRateLimitConfig(t, h)
+	if got.SessionReqPerSec != 12 || got.SessionReqPerMin != 240 || got.SessionBurst != 24 {
+		t.Errorf("session after omitted update = (%v, %v, %d), want preserved (12, 240, 24)",
+			got.SessionReqPerSec, got.SessionReqPerMin, got.SessionBurst)
+	}
+}

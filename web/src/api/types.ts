@@ -3941,6 +3941,9 @@ export interface RateLimitConfig {
   ip_requests_per_second: number;
   ip_requests_per_minute: number;
   ip_burst: number;
+  session_requests_per_second: number;
+  session_requests_per_minute: number;
+  session_burst: number;
   auth_endpoints: Record<string, RateLimitAuthEndpointConfig>;
   /** Whether a limiter is running in this process (GET responses only). */
   active?: boolean;

@@ -43,6 +43,12 @@ func LoadConfig(ctx context.Context, store SettingsStore) (Config, error) {
 	cfg.IPReqPerMinute = parseFloat(all, "ratelimit.ip.requests_per_minute", defaults.IPReqPerMinute)
 	cfg.IPBurst = parseInt(all, "ratelimit.ip.burst", defaults.IPBurst)
 
+	cfg.Session = TierConfig{
+		RequestsPerSecond: parseFloat(all, "ratelimit.session.requests_per_second", defaults.Session.RequestsPerSecond),
+		RequestsPerMinute: parseFloat(all, "ratelimit.session.requests_per_minute", defaults.Session.RequestsPerMinute),
+		Burst:             parseInt(all, "ratelimit.session.burst", defaults.Session.Burst),
+	}
+
 	cfg.AuthEndpoints = make(map[string]AuthEndpointConfig)
 	for name, ep := range defaults.AuthEndpoints {
 		prefix := "ratelimit.auth." + name + "."
@@ -74,6 +80,9 @@ func SeedDefaults(ctx context.Context, store SettingsStore) error {
 		"ratelimit.ip.requests_per_second":                 "120",
 		"ratelimit.ip.requests_per_minute":                 "6000",
 		"ratelimit.ip.burst":                               "120",
+		"ratelimit.session.requests_per_second":            "30",
+		"ratelimit.session.requests_per_minute":            "600",
+		"ratelimit.session.burst":                          "60",
 		"ratelimit.auth.login.requests_per_minute":         "20",
 		"ratelimit.auth.login.burst":                       "10",
 		"ratelimit.auth.signup.requests_per_minute":        "10",
@@ -120,6 +129,9 @@ func SaveConfig(ctx context.Context, store SettingsStore, cfg Config) error {
 	pairs["ratelimit.ip.requests_per_second"] = strconv.FormatFloat(cfg.IPReqPerSecond, 'f', -1, 64)
 	pairs["ratelimit.ip.requests_per_minute"] = strconv.FormatFloat(cfg.IPReqPerMinute, 'f', -1, 64)
 	pairs["ratelimit.ip.burst"] = strconv.Itoa(cfg.IPBurst)
+	pairs["ratelimit.session.requests_per_second"] = strconv.FormatFloat(cfg.Session.RequestsPerSecond, 'f', -1, 64)
+	pairs["ratelimit.session.requests_per_minute"] = strconv.FormatFloat(cfg.Session.RequestsPerMinute, 'f', -1, 64)
+	pairs["ratelimit.session.burst"] = strconv.Itoa(cfg.Session.Burst)
 	for name, ep := range cfg.AuthEndpoints {
 		prefix := "ratelimit.auth." + name + "."
 		pairs[prefix+"requests_per_minute"] = strconv.FormatFloat(ep.RequestsPerMinute, 'f', -1, 64)

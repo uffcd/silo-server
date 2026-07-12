@@ -29,6 +29,9 @@ type rateLimitConfigResponse struct {
 	IPReqPerSecond     float64                               `json:"ip_requests_per_second"`
 	IPReqPerMinute     float64                               `json:"ip_requests_per_minute"`
 	IPBurst            int                                   `json:"ip_burst"`
+	SessionReqPerSec   float64                               `json:"session_requests_per_second"`
+	SessionReqPerMin   float64                               `json:"session_requests_per_minute"`
+	SessionBurst       int                                   `json:"session_burst"`
 	AuthEndpoints      map[string]authEndpointConfigResponse `json:"auth_endpoints"`
 	// Active reports whether a limiter is running in this process. The
 	// limiter is constructed at startup, so config saved while it is absent
@@ -71,6 +74,9 @@ func (h *RateLimitHandler) HandleGetConfig(w http.ResponseWriter, r *http.Reques
 		IPReqPerSecond:     cfg.IPReqPerSecond,
 		IPReqPerMinute:     cfg.IPReqPerMinute,
 		IPBurst:            cfg.IPBurst,
+		SessionReqPerSec:   cfg.Session.RequestsPerSecond,
+		SessionReqPerMin:   cfg.Session.RequestsPerMinute,
+		SessionBurst:       cfg.Session.Burst,
 		AuthEndpoints:      make(map[string]authEndpointConfigResponse),
 		Active:             h.mw != nil,
 	}
@@ -117,7 +123,12 @@ func (h *RateLimitHandler) HandleUpdateConfig(w http.ResponseWriter, r *http.Req
 		IPReqPerSecond:     req.IPReqPerSecond,
 		IPReqPerMinute:     req.IPReqPerMinute,
 		IPBurst:            req.IPBurst,
-		AuthEndpoints:      make(map[string]ratelimit.AuthEndpointConfig),
+		Session: ratelimit.TierConfig{
+			RequestsPerSecond: req.SessionReqPerSec,
+			RequestsPerMinute: req.SessionReqPerMin,
+			Burst:             req.SessionBurst,
+		},
+		AuthEndpoints: make(map[string]ratelimit.AuthEndpointConfig),
 	}
 
 	// Preserve IP settings if not provided (zero values mean omitted from request).
@@ -129,6 +140,17 @@ func (h *RateLimitHandler) HandleUpdateConfig(w http.ResponseWriter, r *http.Req
 	}
 	if cfg.IPBurst == 0 {
 		cfg.IPBurst = existing.IPBurst
+	}
+
+	// Preserve session settings if not provided (zero values mean omitted from request).
+	if cfg.Session.RequestsPerSecond == 0 {
+		cfg.Session.RequestsPerSecond = existing.Session.RequestsPerSecond
+	}
+	if cfg.Session.RequestsPerMinute == 0 {
+		cfg.Session.RequestsPerMinute = existing.Session.RequestsPerMinute
+	}
+	if cfg.Session.Burst == 0 {
+		cfg.Session.Burst = existing.Session.Burst
 	}
 
 	for name, tier := range req.Tiers {
