@@ -34,10 +34,17 @@ const (
 	embeddingTextStaleQuotaPerRun = 200
 )
 
-// SimilarItems returns items most similar to the given item. Blends embedding
-// similarity (70%) with co-watch Jaccard score (30%), applies a validation
-// pipeline, MMR re-ranking, and assigns connection reasons.
+// SimilarItems returns items most similar to the given item, served from a
+// process-local TTL cache (see similarItemsCache) because the computation is
+// user-independent and expensive (~6-8 queries including a pgvector search).
 func (e *Engine) SimilarItems(ctx context.Context, itemID string, limit int) ([]ScoredItem, error) {
+	return e.similarCache.Get(ctx, itemID, limit)
+}
+
+// similarItemsUncached computes items most similar to the given item. Blends
+// embedding similarity (70%) with co-watch Jaccard score (30%), applies a
+// validation pipeline, MMR re-ranking, and assigns connection reasons.
+func (e *Engine) similarItemsUncached(ctx context.Context, itemID string, limit int) ([]ScoredItem, error) {
 	// 1. Fetch source embedding.
 	embedding, err := e.repo.GetEmbedding(ctx, itemID)
 	if err != nil {
@@ -254,7 +261,13 @@ func (e *Engine) EmbedItem(ctx context.Context, itemID string) error {
 		return fmt.Errorf("embed item %s: %w", itemID, err)
 	}
 
-	return e.repo.UpsertEmbedding(ctx, itemID, vectors[0], e.cfg.EmbeddingModel, text)
+	if err := e.repo.UpsertEmbedding(ctx, itemID, vectors[0], e.cfg.EmbeddingModel, text); err != nil {
+		return err
+	}
+	// A fresh embedding invalidates any cached (possibly empty) Similar rail
+	// for this item.
+	e.similarCache.cache.InvalidatePrefix(itemID + ":")
+	return nil
 }
 
 // EmbedAll embeds items that are missing embeddings or have stale canonical

@@ -30,6 +30,7 @@ type Engine struct {
 	embClient     embedder
 	cfg           config.RecommendationsConfig
 	pool          *pgxpool.Pool
+	similarCache  *similarItemsCache
 }
 
 // NewEngine creates a new recommendation Engine.
@@ -49,7 +50,7 @@ func NewEngine(
 		APIKey:  cfg.EmbeddingAuthToken,
 	}
 
-	return &Engine{
+	engine := &Engine{
 		repo:          repo,
 		ratingsRepo:   ratingsRepo,
 		itemRepo:      itemRepo,
@@ -60,6 +61,8 @@ func NewEngine(
 		cfg:           cfg,
 		pool:          pool,
 	}
+	engine.similarCache = newSimilarItemsCache(engine.similarItemsUncached)
+	return engine
 }
 
 // ActiveEmbeddingModel returns the embedding model currently locked for this
