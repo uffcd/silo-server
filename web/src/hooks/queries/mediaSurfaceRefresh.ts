@@ -19,6 +19,8 @@ import {
 
 interface InvalidateMediaSurfaceOptions {
   itemId?: string;
+  /** Additional item ids to invalidate; merged with itemId. */
+  itemIds?: string[];
   libraryId?: number;
   watchedKeys?: Array<readonly unknown[]>;
 }
@@ -123,13 +125,17 @@ export async function invalidateMediaSurfaceQueries(
     }),
   ];
 
+  const itemIds = new Set(options.itemIds ?? []);
   if (options.itemId) {
+    itemIds.add(options.itemId);
+  }
+  for (const itemId of itemIds) {
     invalidations.push(
-      queryClient.invalidateQueries({ queryKey: ["catalog", "items", options.itemId, "detail"] }),
-      queryClient.invalidateQueries({ queryKey: ["items", "detail", options.itemId] }),
-      queryClient.invalidateQueries({ queryKey: ["items", "watchDetail", options.itemId] }),
-      queryClient.invalidateQueries({ queryKey: favoriteKeys.check(options.itemId) }),
-      queryClient.invalidateQueries({ queryKey: watchlistKeys.check(options.itemId) }),
+      queryClient.invalidateQueries({ queryKey: ["catalog", "items", itemId, "detail"] }),
+      queryClient.invalidateQueries({ queryKey: ["items", "detail", itemId] }),
+      queryClient.invalidateQueries({ queryKey: ["items", "watchDetail", itemId] }),
+      queryClient.invalidateQueries({ queryKey: favoriteKeys.check(itemId) }),
+      queryClient.invalidateQueries({ queryKey: watchlistKeys.check(itemId) }),
     );
   }
 

@@ -29,16 +29,12 @@ import {
   type RealtimeConnectionState,
   type RealtimeEventsContextValue,
 } from "@/components/realtimeEventsContext";
-import { invalidateCatalogState } from "@/components/realtimeCatalogInvalidation";
+import { scheduleCatalogInvalidation } from "@/components/realtimeCatalogInvalidation";
 import { useAuth } from "@/hooks/useAuth";
 import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
 import { usePageActivity } from "@/hooks/usePageActivity";
 import { adminKeys, historyImportKeys, libraryKeys } from "@/hooks/queries/keys";
-import {
-  invalidateMediaSurfaceQueries,
-  updateCatalogItemDetail,
-} from "@/hooks/queries/mediaSurfaceRefresh";
-import { bumpHomeRefreshSignal } from "@/pages/homeSurfaceRefresh";
+import { updateCatalogItemDetail } from "@/hooks/queries/mediaSurfaceRefresh";
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation } from "react-router";
@@ -291,11 +287,11 @@ function handleJobSideEffects(
   }
 
   if (eventName === "job.completed" && job.job_type === "catalog_import") {
-    invalidateCatalogState(queryClient, { allowDashboardRefetch });
+    scheduleCatalogInvalidation(queryClient, { allowDashboardRefetch });
   }
 
   if (eventName === "job.completed" && job.job_type === "delete_library") {
-    invalidateCatalogState(queryClient, { allowDashboardRefetch });
+    scheduleCatalogInvalidation(queryClient, { allowDashboardRefetch });
   }
 }
 
@@ -419,15 +415,15 @@ function handleUserStateEvent(
     }));
   }
 
-  void invalidateMediaSurfaceQueries(
-    queryClient,
-    payload.content_id ? { itemId: payload.content_id } : {},
-  ).then(() => {
-    bumpHomeRefreshSignal(queryClient);
-  });
-  void queryClient.invalidateQueries({
-    queryKey: adminKeys.stats(),
-    refetchType: allowDashboardRefetch ? "active" : "none",
+  // The setQueriesData above already flipped the visible flags with no
+  // network cost; the full media-surface refetch can coalesce with other
+  // realtime events. The acting tab stays instant via its own mutation
+  // onSuccess invalidations — this path only serves cross-device/cross-tab
+  // propagation (including per-progress-tick events during playback).
+  scheduleCatalogInvalidation(queryClient, {
+    itemId: payload.content_id,
+    allowDashboardRefetch,
+    includeLibraryLists: false,
   });
 }
 
@@ -639,9 +635,15 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
     switch (message.channel) {
       case "catalog":
         {
+          // The recognized sets are pinned to the server's catalog-channel
+          // event inventory (internal/notifications/hub.go Type constants and
+          // internal/api/handlers/events_publish.go). Unrecognized event names
+          // are ignored here — add new server events to the sets above;
+          // dispatchChannelMessage still delivers every raw event to
+          // feature-specific subscribers.
           const eventLibraryID = catalogEventLibraryID(message.data);
           if (CATALOG_ITEM_CHANGED_EVENTS.has(message.event)) {
-            invalidateCatalogState(queryClient, {
+            scheduleCatalogInvalidation(queryClient, {
               itemId:
                 typeof message.data === "object" && message.data && "content_id" in message.data
                   ? (message.data as { content_id?: string }).content_id
@@ -650,13 +652,10 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
               allowDashboardRefetch: allowDashboardRealtimeUpdatesRef.current,
               includeLibraryLists: false,
             });
-          } else if (SCOPED_CATALOG_LIBRARY_EVENTS.has(message.event) && eventLibraryID) {
-            invalidateCatalogState(queryClient, {
-              libraryId: eventLibraryID,
-              allowDashboardRefetch: allowDashboardRealtimeUpdatesRef.current,
-            });
-          } else {
-            invalidateCatalogState(queryClient, {
+          } else if (SCOPED_CATALOG_LIBRARY_EVENTS.has(message.event)) {
+            // A missing library_id keeps today's behavior: an unscoped
+            // (match-all) invalidation.
+            scheduleCatalogInvalidation(queryClient, {
               libraryId: eventLibraryID,
               allowDashboardRefetch: allowDashboardRealtimeUpdatesRef.current,
             });

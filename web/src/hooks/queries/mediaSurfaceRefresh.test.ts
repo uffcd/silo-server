@@ -91,6 +91,23 @@ describe("invalidateMediaSurfaceQueries", () => {
     expect(queryClient.getQueryState(catalogKeys.itemDetail("item-1"))?.isInvalidated).toBe(true);
   });
 
+  it("marks the detail queries of every listed item stale", async () => {
+    const queryClient = new QueryClient();
+
+    queryClient.setQueryData(catalogKeys.itemDetail("item-1"), { content_id: "item-1" });
+    queryClient.setQueryData(catalogKeys.itemDetail("item-2"), { content_id: "item-2" });
+    queryClient.setQueryData(catalogKeys.itemDetail("item-3"), { content_id: "item-3" });
+
+    await invalidateMediaSurfaceQueries(queryClient, {
+      itemId: "item-1",
+      itemIds: ["item-2", "item-3"],
+    });
+
+    for (const id of ["item-1", "item-2", "item-3"]) {
+      expect(queryClient.getQueryState(catalogKeys.itemDetail(id))?.isInvalidated).toBe(true);
+    }
+  });
+
   it("does not invalidate catalog list queries for a different library scope", async () => {
     const queryClient = new QueryClient();
     const moviesKey = catalogKeys.list({
