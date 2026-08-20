@@ -16,6 +16,12 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
+const (
+	mtimeMSKey     = "mtimeMs"
+	ctimeMSKey     = "ctimeMs"
+	birthtimeMSKey = "birthtimeMs"
+)
+
 // handlePlayStart handles POST /abs/api/items/{libraryItemId}/play.
 //
 // Real ABS clients hit this endpoint to start a playback session and get back
@@ -426,9 +432,9 @@ func buildSiloPlayLibraryItem(
 		"path":             contentID,
 		"relPath":          contentID,
 		"isFile":           true,
-		"mtimeMs":          nil,
-		"ctimeMs":          nil,
-		"birthtimeMs":      nil,
+		mtimeMSKey:         0,
+		ctimeMSKey:         0,
+		birthtimeMSKey:     0,
 		"addedAt":          addedAtMs,
 		"updatedAt":        updatedAtMs,
 		"lastScan":         addedAtMs,

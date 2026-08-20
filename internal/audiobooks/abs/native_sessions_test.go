@@ -133,6 +133,12 @@ func TestHandlePlayStartCreatesNativePlaybackSession(t *testing.T) {
 	if got, _ := track["contentUrl"].(string); got == "" || !strings.Contains(got, "/abs/public/session/"+sessionID+"/track/1") {
 		t.Fatalf("contentUrl = %q, want session-scoped URL", got)
 	}
+	libraryItem, _ := body["libraryItem"].(map[string]any)
+	for _, key := range []string{"mtimeMs", "ctimeMs", "birthtimeMs"} {
+		if _, ok := libraryItem[key].(float64); !ok {
+			t.Errorf("libraryItem[%q] = %#v, want number", key, libraryItem[key])
+		}
+	}
 }
 
 func TestHandleSessionSyncUpdatesNativePlaybackSession(t *testing.T) {
