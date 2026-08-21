@@ -93,6 +93,16 @@ const directPlan = fixturePlanV3({
   },
 });
 
+const progressiveRemuxPlan = fixturePlanV3({
+  delivery: "server_remux_progressive",
+  stream: {
+    url: "/stream/session-1",
+    protocol: "http_progressive",
+    headers: {},
+    header_refresh: "none",
+  },
+});
+
 function playerProps(overrides: Partial<Parameters<typeof VideoPlayer>[0]> = {}) {
   return {
     title: "Test movie",
@@ -184,6 +194,41 @@ describe("VideoPlayer plan failure recovery", () => {
 
       expect(HTMLMediaElement.prototype.play).not.toHaveBeenCalled();
       expect(onPlanFailure).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("recovers a progressive remux that stalls after playback starts", async () => {
+    vi.useFakeTimers();
+    try {
+      const onPlanFailure = vi.fn();
+      const { container } = renderPlayer({
+        plan: progressiveRemuxPlan,
+        onPlanFailure,
+      });
+      const video = container.querySelector("video");
+      if (!video) throw new Error("expected video element");
+
+      await act(async () => Promise.resolve());
+      Object.defineProperty(video, "paused", { configurable: true, value: false });
+      Object.defineProperty(video, "readyState", { configurable: true, value: 2 });
+      Object.defineProperty(video, "currentTime", { configurable: true, value: 42 });
+      fireEvent.timeUpdate(video);
+      await act(async () => Promise.resolve());
+      fireEvent.waiting(video);
+
+      act(() => vi.advanceTimersByTime(4_999));
+      expect(onPlanFailure).not.toHaveBeenCalled();
+
+      act(() => vi.advanceTimersByTime(1));
+      expect(onPlanFailure).toHaveBeenCalledWith(
+        {
+          classification: "transport_stall",
+          message: "Progressive remux playback stopped receiving media.",
+        },
+        42,
+      );
     } finally {
       vi.useRealTimers();
     }

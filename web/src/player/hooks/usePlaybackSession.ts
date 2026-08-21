@@ -916,11 +916,17 @@ export function usePlaybackSession(
     ) {
       return;
     }
-    activeCapabilityRequestKeyRef.current = capabilityRequestKey;
 
     const plan = planRef.current;
     const sessionId = sessionIdRef.current;
     if (!plan || !sessionId) {
+      // Codec/output probes can settle several times while the initial start is
+      // still in flight. Wait for that decision instead of consuming playback
+      // capacity with overlapping starts; loading becoming false reruns this
+      // effect and applies the newest capabilities to the adopted plan.
+      if (state.loading) return;
+
+      activeCapabilityRequestKeyRef.current = capabilityRequestKey;
       const startIntent = startIntentRef.current;
       const resumeFromAdoptedPlan = hasAdoptedPlanRef.current;
       void loadSession({
@@ -934,6 +940,7 @@ export function usePlaybackSession(
       return;
     }
 
+    activeCapabilityRequestKeyRef.current = capabilityRequestKey;
     if (!serverFeaturesRef.current.includes(FEATURE_OUTPUT_CHANGE_V3)) {
       return;
     }
@@ -945,7 +952,15 @@ export function usePlaybackSession(
       },
       true,
     );
-  }, [capabilityRequestKey, fileId, loadSession, replan, requestKey, retireActiveSession]);
+  }, [
+    capabilityRequestKey,
+    fileId,
+    loadSession,
+    replan,
+    requestKey,
+    retireActiveSession,
+    state.loading,
+  ]);
 
   const switchAudioTrack = useCallback(
     (index: number, currentPosition: number) => {

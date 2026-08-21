@@ -226,6 +226,8 @@ export function useAudiobookPlayback({
     () => buildClientPlaybackContextV3(capabilityProbe),
     [capabilityProbe],
   );
+  const clientCapabilitiesRef = useRef(clientCapabilities);
+  const clientPlaybackContextRef = useRef(clientPlaybackContext);
   const audioRef = useRef<HTMLAudioElement>(null);
   const parts = useMemo(() => buildParts(files), [files]);
   const duration = useMemo(() => totalDuration(parts), [parts]);
@@ -275,6 +277,15 @@ export function useAudiobookPlayback({
   // Wall-clock time playback last paused, for smart rewind on resume. Cleared
   // by explicit seeks so a hand-picked position is never second-guessed.
   const pausedAtRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    // Output probes can settle after playback starts (for example, the async
+    // HDR10 probe). Audiobooks only need the latest evidence when they start or
+    // recover; a display-capability update must not replace a working audio
+    // session.
+    clientCapabilitiesRef.current = clientCapabilities;
+    clientPlaybackContextRef.current = clientPlaybackContext;
+  }, [clientCapabilities, clientPlaybackContext]);
 
   const setAbsoluteTime = useCallback(
     (seconds: number) => {
@@ -410,8 +421,8 @@ export function useAudiobookPlayback({
                 attemptCount,
                 metered: detectMeteredV3(),
                 bandwidthEstimateKbps: detectBandwidthEstimateKbpsV3(),
-                clientCapabilities,
-                clientPlaybackContext,
+                clientCapabilities: clientCapabilitiesRef.current,
+                clientPlaybackContext: clientPlaybackContextRef.current,
               }),
             ),
           },
@@ -466,7 +477,7 @@ export function useAudiobookPlayback({
         }
       }
     },
-    [adoptPlan, clientCapabilities, clientPlaybackContext, config],
+    [adoptPlan, config],
   );
 
   useEffect(() => {
@@ -570,8 +581,8 @@ export function useAudiobookPlayback({
             progressPersistence: "client",
             metered: detectMeteredV3(),
             bandwidthEstimateKbps: detectBandwidthEstimateKbpsV3() ?? null,
-            clientCapabilities,
-            clientPlaybackContext,
+            clientCapabilities: clientCapabilitiesRef.current,
+            clientPlaybackContext: clientPlaybackContextRef.current,
           }),
         ),
       });
@@ -629,16 +640,7 @@ export function useAudiobookPlayback({
         planRef.current = null;
       }
     };
-  }, [
-    activePart,
-    adoptPlan,
-    clientCapabilities,
-    clientPlaybackContext,
-    config,
-    fileId,
-    sourceRevision,
-    stopSession,
-  ]);
+  }, [activePart, adoptPlan, config, fileId, sourceRevision, stopSession]);
 
   useEffect(() => {
     const audio = audioRef.current;

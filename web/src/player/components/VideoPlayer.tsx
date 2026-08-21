@@ -162,6 +162,7 @@ interface VideoPlayerProps {
 const hlsPromise: Promise<typeof HlsType> = import("hls.js").then((m) => m.default);
 const EXIT_PROGRESS_FLUSH_TIMEOUT_MS = 1_000;
 const FIREFOX_COMPATIBILITY_FALLBACK_DELAY_MS = 8_000;
+const PROGRESSIVE_STALL_RECOVERY_DELAY_MS = 5_000;
 
 interface PlaybackNoticeState {
   title?: string;
@@ -278,6 +279,7 @@ export function VideoPlayer({
   const [hasEnded, setHasEnded] = useState(false);
   const onEndedRef = useRef(onEnded);
   const currentTimeRef = useRef(0);
+  const transportPlaybackStartedRef = useRef(false);
   const durationRef = useRef(propDuration ?? 0);
   const compatibilityFallbackKeyRef = useRef<string | null>(null);
   const lastRoomCommandIdRef = useRef<string | null>(null);
@@ -297,6 +299,7 @@ export function VideoPlayer({
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [buffering, setBuffering] = useState(false);
   const bufferingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const progressiveStallRecoveryTimerRef = useRef<number | null>(null);
   const [awaitingFirstFrame, setAwaitingFirstFrame] = useState(true);
   const [isLeaving, setIsLeaving] = useState(false);
   const leaveInProgressRef = useRef(false);
@@ -400,6 +403,10 @@ export function VideoPlayer({
 
   useEffect(() => {
     transportFailedForPlanRevisionRef.current = null;
+    if (progressiveStallRecoveryTimerRef.current !== null) {
+      window.clearTimeout(progressiveStallRecoveryTimerRef.current);
+      progressiveStallRecoveryTimerRef.current = null;
+    }
   }, [planRevision]);
 
   const failHlsStartup = useCallback(() => {
@@ -529,6 +536,9 @@ export function VideoPlayer({
       isMountedRef.current = false;
       if (roomCommandTimerRef.current !== null) {
         window.clearTimeout(roomCommandTimerRef.current);
+      }
+      if (progressiveStallRecoveryTimerRef.current !== null) {
+        window.clearTimeout(progressiveStallRecoveryTimerRef.current);
       }
     };
   }, []);
@@ -1384,6 +1394,7 @@ export function VideoPlayer({
     let nativeHLSMetadataHandler: (() => void) | null = null;
 
     mediaRecoveryAttemptsRef.current = 0;
+    transportPlaybackStartedRef.current = false;
     setError(null);
     setAwaitingFirstFrame(true);
 
@@ -1595,8 +1606,42 @@ export function VideoPlayer({
     const video = videoRef.current;
     if (!video) return;
 
-    const onPlay = () => setPlaying(true);
-    const onPause = () => setPlaying(false);
+    const clearProgressiveStallRecovery = () => {
+      if (progressiveStallRecoveryTimerRef.current !== null) {
+        window.clearTimeout(progressiveStallRecoveryTimerRef.current);
+        progressiveStallRecoveryTimerRef.current = null;
+      }
+    };
+    const scheduleProgressiveStallRecovery = () => {
+      if (
+        plan.delivery !== "server_remux_progressive" ||
+        video.paused ||
+        !transportPlaybackStartedRef.current ||
+        progressiveStallRecoveryTimerRef.current !== null
+      ) {
+        return;
+      }
+      progressiveStallRecoveryTimerRef.current = window.setTimeout(() => {
+        progressiveStallRecoveryTimerRef.current = null;
+        if (video.paused || video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) return;
+        if (
+          !reportCurrentPlanFailure({
+            classification: "transport_stall",
+            message: "Progressive remux playback stopped receiving media.",
+          })
+        ) {
+          setError("Playback stalled. Please try again.");
+        }
+      }, PROGRESSIVE_STALL_RECOVERY_DELAY_MS);
+    };
+    const onPlay = () => {
+      setPlaying(true);
+      scheduleProgressiveStallRecovery();
+    };
+    const onPause = () => {
+      setPlaying(false);
+      clearProgressiveStallRecovery();
+    };
     const clearBuffering = () => {
       if (bufferingTimerRef.current) {
         clearTimeout(bufferingTimerRef.current);
@@ -1605,6 +1650,7 @@ export function VideoPlayer({
       setBuffering(false);
     };
     const markPlaybackStarted = () => {
+      transportPlaybackStartedRef.current = true;
       hlsStartupGuardRef.current?.markPlaybackStarted();
       setAwaitingFirstFrame(false);
     };
@@ -1620,12 +1666,14 @@ export function VideoPlayer({
       // where `waiting` fired but `canplay`/`playing` never followed.
       markPlaybackStarted();
       clearBuffering();
+      clearProgressiveStallRecovery();
     };
     const onSeeked = () => {
       setPendingSeekTime(null);
       setCurrentTime(toMediaTime(video.currentTime, timelineOffsetRef.current));
       markPlaybackStarted();
       clearBuffering();
+      clearProgressiveStallRecovery();
       if (roomSyncWaiting && watchTogetherSync.attachedSessionId === sessionId) {
         watchTogetherSync.reportReady();
       }
@@ -1654,21 +1702,25 @@ export function VideoPlayer({
           bufferingTimerRef.current = null;
         }, 500);
       }
+      scheduleProgressiveStallRecovery();
       if (watchTogetherRoomActive && watchTogetherSync.attachedSessionId === sessionId) {
         watchTogetherSync.reportBuffering();
       }
     };
     const onCanPlay = () => {
       clearBuffering();
+      clearProgressiveStallRecovery();
       if (roomSyncWaiting && watchTogetherSync.attachedSessionId === sessionId) {
         watchTogetherSync.reportReady();
       }
     };
     const onPlaying = () => {
       clearBuffering();
+      clearProgressiveStallRecovery();
       markPlaybackStarted();
     };
     const onStalled = () => {
+      scheduleProgressiveStallRecovery();
       if (watchTogetherRoomActive && watchTogetherSync.attachedSessionId === sessionId) {
         watchTogetherSync.reportBuffering();
       }
@@ -1728,6 +1780,7 @@ export function VideoPlayer({
     // room snapshot churn doesn't re-subscribe every listener.
   }, [
     pendingSeekTime,
+    plan.delivery,
     reportCurrentPlanFailure,
     roomSyncWaiting,
     sessionId,

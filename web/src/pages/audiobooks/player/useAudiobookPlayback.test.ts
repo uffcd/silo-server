@@ -251,6 +251,59 @@ describe("useAudiobookPlayback", () => {
     });
   });
 
+  it("keeps one audio session while output capability probes settle", async () => {
+    let hdr = false;
+    const listeners = new Set<() => void>();
+    const query = {
+      get matches() {
+        return hdr;
+      },
+      addEventListener: (_: string, listener: () => void) => listeners.add(listener),
+      removeEventListener: (_: string, listener: () => void) => listeners.delete(listener),
+    };
+    vi.stubGlobal("matchMedia", () => query);
+
+    let resolveStart: ((response: Response) => void) | undefined;
+    const pendingStart = new Promise<Response>((resolve) => {
+      resolveStart = resolve;
+    });
+    let startCount = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/playback/start")) {
+          startCount += 1;
+          return pendingStart;
+        }
+        if (url.endsWith("/playback/route-events")) {
+          return new Response(null, { status: 202 });
+        }
+        if (url.includes("/progress") || init?.method === "DELETE") {
+          return new Response(null, { status: 204 });
+        }
+        return jsonResponse({});
+      }),
+    );
+
+    const { result } = renderAudiobookPlayback();
+    await flushAsyncWork();
+    expect(startCount).toBe(1);
+
+    act(() => {
+      hdr = true;
+      for (const listener of listeners) listener();
+    });
+    await flushAsyncWork();
+    expect(startCount).toBe(1);
+
+    resolveStart?.(jsonResponse(audioOnlyDecision("session-1", 0), { status: 201 }));
+    await flushAsyncWork();
+
+    expect(startCount).toBe(1);
+    expect(result.current.streamUrl).toBe("/api/v1/stream/session-1?token=token");
+  });
+
   it("advertises the delivery classes the audio-only planner routes to", async () => {
     renderAudiobookPlayback();
 
