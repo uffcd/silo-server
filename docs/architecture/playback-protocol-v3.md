@@ -98,13 +98,14 @@ the document is always the full one:
   "protocol_versions": [3],
   "features": ["playback_plan_v3", "neutral_playback_v3_contract_v1", "layout_aware_passthrough", "playback_route_diagnostics",
                "device_quirks_v1", "seek_reanchor_v1", "output_change_v1", "direct_stream_resume_v1",
+               "header_authenticated_media_v1", "authorized_media_origins_v1", "software_video_decode_v1",
                "plan_source_duration_v1"],
   "deliveries": ["original_http", "server_remux_progressive", "server_remux_hls", "server_transcode_hls"],
   "transformations": [{"name": "audio_to_aac", "executor": "server", "recipe_version": "1", "validated_claims": ["audio_decode"]}]
 }
 ```
 
-The nine feature strings above are the full set this server version advertises:
+The twelve feature strings above are the full set this server version advertises:
 
 | Feature | What it promises |
 | --- | --- |
@@ -116,6 +117,9 @@ The nine feature strings above are the full set this server version advertises:
 | `seek_reanchor_v1` | The `seek_reanchor` replan operation is available (§6) |
 | `output_change_v1` | The `output_change` intent replan is available; clients must keep the active route when this feature is absent |
 | `direct_stream_resume_v1` | A direct route may resume mid-file rather than restarting |
+| `header_authenticated_media_v1` | An opted-in client receives media URLs without signed credentials in their query or path, and authenticates every media request with its normal Authorization header (§4.1) |
+| `authorized_media_origins_v1` | Meaningful only with the token above: the client also honors credential-free absolute media URLs on server-designated proxy origins, which restores distributed egress for a header-authenticated attempt (§4.1) |
+| `software_video_decode_v1` | Exact/platform-attested clients may qualify bounded `video_decode[]` entries with `hardware: false` for direct/original delivery; without the opt-in those evidence tiers remain hardware-only (§3) |
 | `plan_source_duration_v1` | `source.duration_seconds` is populated when known, so its absence means *unknown* rather than *unsupported* (§5) |
 
 That last one is the reason feature detection is a list and not a version
@@ -307,14 +311,15 @@ required and are one of:
 | Tier | Who reports it | What the server does with it |
 | --- | --- | --- |
 | `exact` | Android (`MediaCodecList`) | Full strict validation. The server walks `video_decode[]` and requires a hardware entry matching codec, profile, level, bit depth, and every `max_*` bound. Only this tier can earn a validated audio **passthrough** claim. |
-| `platform_attested` | Apple (VideoToolbox) | Same walk, but profile and level are **skipped** — the platform attests the codec family rather than enumerating modes. All other bounds still apply. |
+| `platform_attested` | Apple (platform-backed Aether decoder stack) | Same walk. Profile and level are **skipped for hardware entries** because the platform cannot enumerate them; explicitly opted-in software entries enforce any profiles/levels the pinned stack supplies. All other bounds still apply. |
 | `declared` | Web (`isTypeSupported`) | Flat list match only: `codecs_video` / `codecs_video_hardware` membership. No `video_decode[]` walk. |
 
 Four rules follow from the table and are easy to get wrong:
 
 **A flat claim without backing detail is a refusal, not a pass.** On `exact` and
 `platform_attested`, if a codec appears in `codecs_video` but no `video_decode[]`
-entry names that codec with `hardware: true`, the source is *not* eligible for a
+entry names that codec with `hardware: true` (or an explicitly opted-in bounded
+software entry), the source is *not* eligible for a
 direct route. The plan is downgraded and carries the decision reason
 `evidence_insufficient_for_direct` plus the matching degradation warning, which
 distinguishes "your evidence didn't support this" from "your device said no." A
@@ -327,6 +332,27 @@ If an entry matched the codec but the source exceeded one of its bounds — a
 4K file against a `max_height: 1080` decoder — that is a real device limit, and
 the plan is downgraded with no evidence warning. The two cases mean different
 things and a client should not conflate them in its telemetry.
+
+Software decode remains explicit. At `exact` and `platform_attested`, a
+`hardware: false` entry participates only when the request advertises
+`software_video_decode_v1`; the same codec, bit-depth, dimension, frame-rate,
+bitrate, and supplied profile/level bounds are then enforced. Existing clients therefore retain the
+historical hardware-only behavior at these tiers.
+
+Download creation reuses this bounded vocabulary additively inside `caps`:
+`client_features`, `video_evidence`, and `video_decode` have the same meanings
+and limits. Opting in requires a non-empty exact/platform-attested detailed
+list; malformed partial opt-ins are rejected rather than falling back to flat
+claims. This matters when hardware and software decoders have different
+ceilings: the flat `max_resolution` remains a coarse device ceiling, while the
+detailed entry decides whether a particular original file is safe. Apple keeps
+the legacy coarse ceiling at 1080p so older servers fail safely; a detailed
+hardware entry may independently preserve a 4K original on a new server.
+Legacy flat-only download clients keep the previous resolver behavior. When a
+file's probe metadata is too sparse for the detailed bounds walk to run at
+all, the flat claims decide instead — including the coarse `max_resolution`
+ceiling — so sparse metadata cannot widen eligibility beyond the flat
+contract.
 
 **An omitted bound means "unconstrained", not "unknown".** Within a
 `video_decode[]` entry, an empty `profiles`, `levels`, or `bit_depths` list and a
@@ -445,6 +471,121 @@ omits entirely is unavailable — the server will not guess.
 `stream.header_refresh` tells the client what to do when the stream URL's auth
 expires: `none` means the URL is stable for the session, `session` means
 re-request headers from `header_refresh_url` rather than restarting playback.
+
+### 4.1 Header-authenticated media URLs
+
+`header_authenticated_media_v1` is an engine-neutral client opt-in. A client
+uses it only after the server advertises the same token, then includes it in the
+top-level `client_features` on start and replan requests. It negotiates *how*
+media URLs authenticate; `authorized_media_origins_v1` (below) separately
+negotiates *which origins* may serve them.
+
+With `header_authenticated_media_v1` alone, the server returns only relative
+URLs on the authenticated API origin:
+
+- direct and progressive remux: `/stream/{session_id}` (an ordinary `seek`
+  parameter may still be present);
+- remux/transcode HLS: `/playback/transcode/{session_id}/master.m3u8`, with
+  relative, credential-free segment URLs in the manifest;
+- subtitle artifacts, inventory sidecars and font bundles:
+  `/stream/{session_id}/subtitles/...`.
+
+None of those client-visible URLs contains the signed playback token (`st`) or
+a token-bearing proxy path, and no proxy or transcode-node origin is returned.
+A pooled transcode node may still execute HLS behind the API server; the API
+relays its manifest and segments over the same authenticated client route.
+Direct-play and progressive-remux proxy routes are bypassed because those
+nodes accept a signed URL token rather than the user's API credential, so the
+normal local-remux fallback policy still applies. On a server that disables
+`playback.local_transcode_fallback`, a progressive remux needing a server
+transformation therefore has no executor at all: the server plans the same
+recipe as `server_remux_hls` instead, which a pooled transcode node can run
+behind the API. A client that advertises no HLS delivery gets the non-retryable
+terminal `local_transcode_disabled` rather than a retryable capacity error it
+could only retry forever.
+
+**Authorized media origins.** A client that also sends
+`authorized_media_origins_v1` promises something further: it will fetch media
+from absolute URLs the plan returns on origins the server designates, attaching
+the same `Authorization` header it sends the API. For such an attempt a plan may
+return a proxy origin instead of a relative path:
+
+- direct and progressive remux: `{proxy}/stream/v3/{session_id}` (again with an
+  ordinary `seek` parameter when non-zero);
+- remux/transcode HLS: `{proxy}/stream/v3/{session_id}/master.m3u8`, whose
+  segment URIs stay relative and therefore resolve inside the same family.
+
+Those URLs still carry no credential of any kind — no `st`, no token path
+segment, no query parameter. The proxy is told what to serve out of band, and
+authenticates the caller itself: it validates the same access token against the
+same live login session the API checks, so revoking a session stops proxy
+playback immediately, exactly as it stops API playback. A server with no proxy
+pool, or one that cannot record the handoff, simply keeps the attempt on the API
+origin — the URLs above are an addition a plan may make, never one a client may
+assume. The escalation described just above therefore applies only when no proxy
+origin is available to run the remux.
+
+Only media moves. Start, replan, route events, progress and every other
+control-plane call stay on the API origin, and the attempt's plan remains the
+sole authority for which URL to fetch.
+
+The client must attach its current `Authorization: Bearer ...` header to the
+manifest/file request and every derived request, including HLS segments,
+subtitle artifacts and font bundles. `stream.headers` deliberately does not
+echo the bearer token: plans are persisted for idempotent replay, while the
+client already owns the current access credential. `header_refresh: none`
+means the relative media URL itself is stable; normal API-token refresh remains
+out of band, after which a client can retry or reload that URL with the new
+header.
+
+The signed playback token is what carries a reconstruction recipe across an
+API restart. Opting it out therefore also opts out of transparent session
+reconstruction: a missing in-memory session returns the normal expired/missing
+response and the client starts a fresh attempt. Once selected, this mode is
+sticky for the lifetime of the attempt; a client that can no longer honor it
+must stop and start a new attempt rather than downgrade a replan to a
+credential-bearing URL.
+
+**Replica affinity.** Because there is no reconstruction recipe, a
+header-authenticated attempt's session exists only in the memory of the API
+process that started it. A media request routed to any other replica finds no
+session and returns the expired/missing response, so a deployment serving
+tokenless attempts currently needs either a single API replica or session
+affinity on the media routes; legacy token-bearing attempts are unaffected,
+since they reconstruct anywhere. Proxy-origin URLs
+(`authorized_media_origins_v1`) are also unaffected: the proxy serves from the
+shared grant store rather than from an API process's memory. Moving session
+state into shared storage is the fix, and until it lands this constraint is
+part of the deployment contract.
+
+### 4.2 Media and subtitle URL query parameters
+
+Every URL a plan publishes belongs to one of the route families below, and the
+query parameters each family accepts are part of the contract. A client replays the
+URL it was handed byte-for-byte; it never composes one, never drops a
+parameter, and never carries a parameter across families.
+
+| Route family | Routes | Query parameters |
+| --- | --- | --- |
+| Media | `/stream/{session_id}`, `/playback/transcode/{session_id}/master.m3u8` and its segments | `seek` only — the progressive-remux start offset in seconds, present only when it is non-zero |
+| Media on a designated origin | `{proxy}/stream/v3/{session_id}`, `{proxy}/stream/v3/{session_id}/master.m3u8` and its `segment/{name}` children (§4.1) | `seek` only, with the same meaning; these routes never accept a credential parameter of any kind |
+| Subtitle artifact | `/stream/{session_id}/subtitles/{combined_index}{.ext}`, `/stream/{session_id}/subtitles/{combined_index}/fonts` | `file_id`, always; plus `downloaded_subtitle_id` when the track is a downloaded or AI-generated one (§8) |
+
+A media route never carries `file_id` or `downloaded_subtitle_id` — the session
+already names the file it plays, and the media timeline is anchored by `seek`
+plus the fields in §5. A subtitle route never carries `seek`: a sidecar is
+fetched whole and timed against `subtitle.artifact.timing_origin_seconds`.
+
+`file_id` is required on a subtitle route because a plan can fall back to an
+alternate edition, so the session id alone does not fix which file's ordinal
+space `{combined_index}` addresses. `downloaded_subtitle_id` pins the exact
+downloaded row behind that ordinal, which is what keeps the URL stable when the
+downloaded segment of the inventory is reordered or grows mid-session (§8).
+
+An attempt that did not opt into `header_authenticated_media_v1` additionally
+carries the signed stream token `st` on its media URLs — never on subtitle or
+font-bundle routes. It is an opaque transport credential rather than a playback
+parameter, and it is outside the table above.
 
 ---
 
@@ -576,6 +717,21 @@ A seek-scoped recovery refuses to accept new capability or device evidence: a
 seek is not an authority boundary for replacing the client's declared abilities
 mid-session.
 
+**Attempt-sticky features.** `client_features` is otherwise refreshed by any
+replan that sends it, but three entries are fixed by the start negotiation and a
+replan can neither add nor drop them:
+
+| Feature | Why it is fixed |
+| --- | --- |
+| `header_authenticated_media_v1` | It selects the media security contract. A signed URL from an earlier plan stays usable until its recipe expires, so a mid-attempt switch would leave two contracts alive for one session (§4.1) |
+| `authorized_media_origins_v1` | It selects which origins may serve the attempt's media. A plan that already handed out a proxy origin outlives the replan that would revoke it, so the client would be left holding a URL it no longer trusts (§4.1) |
+| `software_video_decode_v1` | It widens the direct-play evidence tiers. Dropping it converts a direct route into a transcode and persists that downgrade into the durable request |
+
+The server silently restores the negotiated state of each, whatever the replan
+sends — including an explicit list that omits one, which is otherwise a valid
+way to drop a feature. Seek replans never replace the feature list at all.
+Changing any of these modes means stopping and starting a new attempt.
+
 ---
 
 ## 7. Registries
@@ -631,6 +787,7 @@ HDR, 4K, or transcode-policy reason — deselecting the subtitle restores playba
 
 *Transport and session:* `internal_error`, `session_expired`,
 `subtitle_artifact_unavailable`, `capacity_unavailable`,
+`local_transcode_disabled`,
 `audio_transcoding_disabled`,
 `transcode_start_failed`, `transcode_node_unavailable`,
 `transcode_node_capability_unavailable`, `track_unavailable`,
@@ -704,6 +861,18 @@ without first asking for a plan it does not want.
 transcodes it to a client-renderable format first — always to WebVTT, served as
 `text/vtt` at a `.vtt` URL), or `burn_in` (rendered into the video, which forces
 a transcode).
+
+`subtitle.artifact` is the one track the plan tells the client to draw, and it
+is present **only** under `render` and `convert`. Under `off` and `burn_in` it
+is absent, and every plan states this afresh: an artifact is never carried over
+from an earlier plan of the same session, so a client must take the current
+plan's `subtitle` block literally rather than remembering the previous one.
+`off` also carries no `subtitle.track_id`. The inventory `url`s are unaffected
+— they describe what is fetchable, not what is selected, and stay published in
+every mode.
+
+Subtitle artifact, inventory and font-bundle URLs are session-scoped and carry
+their own query parameters; see §4.2 for the per-route-family contract.
 
 The sidecar URL suffix is part of the representation contract, not decoration.
 An embedded `hdmv_pgs_subtitle`/PGS sidecar is lossless binary PGS at a `.sup`

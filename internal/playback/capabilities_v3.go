@@ -128,13 +128,15 @@ func videoEligibleV3(source SourceDescriptorV3, request StartRequestV3) (bool, b
 		// planner); there is no stricter validation to run.
 		return flatClaims, false
 	case EvidenceExactV3, EvidencePlatformAttestedV3:
-		skipProfileLevel := request.Capabilities.VideoEvidence == EvidencePlatformAttestedV3
+		softwareDecodeOptIn := HasFeatureV3(request.ClientFeatures, FeatureSoftwareVideoDecodeV3)
 		matchedCodec := false
 		for _, capability := range request.Capabilities.VideoDecode {
-			if !strings.EqualFold(capability.Codec, source.VideoCodec) || !capability.Hardware {
+			if !strings.EqualFold(capability.Codec, source.VideoCodec) ||
+				(!capability.Hardware && !softwareDecodeOptIn) {
 				continue
 			}
 			matchedCodec = true
+			skipProfileLevel := request.Capabilities.VideoEvidence == EvidencePlatformAttestedV3 && capability.Hardware
 			if !skipProfileLevel {
 				if len(capability.Profiles) > 0 && (source.VideoProfile == "" || !containsFoldV3(capability.Profiles, source.VideoProfile)) {
 					continue

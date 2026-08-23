@@ -123,5 +123,8 @@ func (h *PlaybackHandler) setRealtimeConnectionState(sessionID string, connected
 		slog.Warn("failed to update realtime connection state", "session", sessionID, "connected", connected, "error", err)
 		return false
 	}
+	if h.StreamTelemetry != nil {
+		h.StreamTelemetry.SetRealtimeConnection(sessionID, connected)
+	}
 	return true
 }

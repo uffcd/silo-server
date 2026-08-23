@@ -22,15 +22,18 @@ func TestServerFeaturesV3ReturnsCompleteIndependentSlices(t *testing.T) {
 	first := ServerFeaturesV3()
 	second := ServerFeaturesV3()
 	expected := map[string]struct{}{
-		FeaturePlaybackPlanV3:       {},
-		FeatureNeutralContractV3:    {},
-		FeatureLayoutPassthrough:    {},
-		FeatureRouteDiagnostics:     {},
-		FeatureDeviceQuirksV3:       {},
-		FeatureSeekReanchorV3:       {},
-		FeatureOutputChangeV3:       {},
-		FeatureDirectStreamResumeV3: {},
-		FeaturePlanSourceDurationV3: {},
+		FeaturePlaybackPlanV3:             {},
+		FeatureNeutralContractV3:          {},
+		FeatureLayoutPassthrough:          {},
+		FeatureRouteDiagnostics:           {},
+		FeatureDeviceQuirksV3:             {},
+		FeatureSeekReanchorV3:             {},
+		FeatureOutputChangeV3:             {},
+		FeatureDirectStreamResumeV3:       {},
+		FeatureHeaderAuthenticatedMediaV3: {},
+		FeatureAuthorizedMediaOriginsV3:   {},
+		FeatureSoftwareVideoDecodeV3:      {},
+		FeaturePlanSourceDurationV3:       {},
 	}
 	if len(first) != len(expected) {
 		t.Fatalf("server features = %v, want %d entries", first, len(expected))
@@ -552,8 +555,8 @@ func TestStartRequestV3RequiresCapabilityEvidenceTiers(t *testing.T) {
 
 // The same SDR source must reach a tier-appropriate route for each evidence
 // tier: exact and platform_attested validate against decode entries (the
-// latter without profile/level matching), declared grants the copy route on
-// the flat codec+container match alone.
+// latter skips profile/level only for hardware attestations), while declared
+// grants the copy route on the flat codec+container match alone.
 func TestPlanPlaybackV3EvidenceTiersReachTierAppropriateRoutes(t *testing.T) {
 	file := detailedFixtureFileV3()
 	file.VideoTracks[0].VideoRange = "SDR"
@@ -800,6 +803,159 @@ func TestPlanPlaybackV3TranscodesVP9WithUnknownCodecLevel(t *testing.T) {
 	}
 	if result.TargetVideoCodec != "h264" || result.TargetAudioCodec != "aac" {
 		t.Fatalf("targets = video %q audio %q", result.TargetVideoCodec, result.TargetAudioCodec)
+	}
+}
+
+func TestVideoEligibleV3BoundedSoftwareDecodeRequiresExplicitFeature(t *testing.T) {
+	source := SourceDescriptorV3{
+		VideoCodec: "h264", VideoProfile: "high 10", BitDepth: 10,
+		Width: 1920, Height: 1080, FrameRate: 24, BitrateKbps: 9_000,
+	}
+	req := validStartRequestV3()
+	req.Capabilities.VideoEvidence = EvidencePlatformAttestedV3
+	req.Capabilities.CodecsVideo = []string{"h264"}
+	req.Capabilities.CodecsVideoHardware = nil
+	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{
+		Codec: "h264", Profiles: []string{"high 10"}, BitDepths: []int{10}, MaxWidth: 1920,
+		MaxHeight: 1080, MaxFrameRate: 60, MaxBitrateKbps: 40_000,
+		Hardware: false,
+	}}
+
+	if eligible, insufficient := videoEligibleV3(source, req); eligible || !insufficient {
+		t.Fatalf("software entry without opt-in = eligible %v insufficient %v", eligible, insufficient)
+	}
+
+	req.ClientFeatures = append(req.ClientFeatures, FeatureSoftwareVideoDecodeV3)
+	if eligible, insufficient := videoEligibleV3(source, req); !eligible || insufficient {
+		t.Fatalf("opted-in bounded software entry = eligible %v insufficient %v", eligible, insufficient)
+	}
+
+	source.VideoProfile = "main"
+	if eligible, insufficient := videoEligibleV3(source, req); eligible || insufficient {
+		t.Fatalf("software entry outside its exercised profile = eligible %v insufficient %v", eligible, insufficient)
+	}
+
+	source.VideoProfile = "high 10"
+	source.Width = 3_840
+	if eligible, insufficient := videoEligibleV3(source, req); eligible || insufficient {
+		t.Fatalf("software entry beyond its width bound = eligible %v insufficient %v", eligible, insufficient)
+	}
+}
+
+func TestVideoEligibleV3SoftwareEntryCanFollowARejectingHardwareEntryForTheSameCodec(t *testing.T) {
+	source := SourceDescriptorV3{
+		VideoCodec: "h264", VideoProfile: "high 10", BitDepth: 10,
+		Width: 1920, Height: 1080, FrameRate: 24, BitrateKbps: 9_000,
+	}
+	req := validStartRequestV3()
+	req.Capabilities.VideoEvidence = EvidencePlatformAttestedV3
+	req.Capabilities.CodecsVideo = []string{"h264"}
+	req.Capabilities.CodecsVideoHardware = []string{"h264"}
+	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{
+		{
+			Codec: "h264", BitDepths: []int{8}, MaxWidth: 1920,
+			MaxHeight: 1080, MaxFrameRate: 60, MaxBitrateKbps: 25_000,
+			Hardware: true,
+		},
+		{
+			Codec: "h264", Profiles: []string{"high 10"}, BitDepths: []int{10}, MaxWidth: 1920,
+			MaxHeight: 1080, MaxFrameRate: 60, MaxBitrateKbps: 40_000,
+			Hardware: false,
+		},
+	}
+
+	if eligible, insufficient := videoEligibleV3(source, req); eligible || insufficient {
+		t.Fatalf("duplicate codec without software opt-in = eligible %v insufficient %v", eligible, insufficient)
+	}
+	req.ClientFeatures = append(req.ClientFeatures, FeatureSoftwareVideoDecodeV3)
+	if eligible, insufficient := videoEligibleV3(source, req); !eligible || insufficient {
+		t.Fatalf("duplicate codec with software opt-in = eligible %v insufficient %v", eligible, insufficient)
+	}
+}
+
+func TestPlanPlaybackV3AppleSoftwareEnvelopeSelectsOriginalHTTP(t *testing.T) {
+	tests := []struct {
+		name, codec, sourceProfile, claimedProfile, resolution, frameRate string
+		bitDepth, width, height, maxFrameRate, bitrate, maxBitrate        int
+	}{
+		{name: "h264 high 10", codec: "h264", sourceProfile: "High 10", claimedProfile: "high 10", resolution: "1080p", frameRate: "24000/1001", bitDepth: 10, width: 1920, height: 1080, maxFrameRate: 30, bitrate: 9_000, maxBitrate: 10_000},
+		{name: "av1 main 10", codec: "av1", sourceProfile: "Main", claimedProfile: "main", resolution: "1080p", frameRate: "24", bitDepth: 10, width: 1920, height: 1080, maxFrameRate: 30, bitrate: 2_500, maxBitrate: 3_000},
+		{name: "vp9 profile 0", codec: "vp9", sourceProfile: "Profile 0", claimedProfile: "profile 0", resolution: "1080p", frameRate: "24", bitDepth: 8, width: 1920, height: 1080, maxFrameRate: 30, bitrate: 2_600, maxBitrate: 3_000},
+		{name: "mpeg2 main interlaced", codec: "mpeg2video", sourceProfile: "Main", claimedProfile: "main", resolution: "480p", frameRate: "30.303", bitDepth: 8, width: 720, height: 480, maxFrameRate: 31, bitrate: 6_200, maxBitrate: 7_000},
+		{name: "vc1 advanced", codec: "vc1", sourceProfile: "Advanced", claimedProfile: "advanced", resolution: "1080p", frameRate: "24", bitDepth: 8, width: 1920, height: 1080, maxFrameRate: 30, bitrate: 31_200, maxBitrate: 32_000},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			file := detailedFixtureFileV3()
+			file.CodecVideo = test.codec
+			file.Resolution = test.resolution
+			file.Bitrate = test.bitrate
+			file.VideoTracks[0] = models.VideoTrack{
+				Codec: test.codec, Profile: test.sourceProfile, Width: test.width, Height: test.height,
+				FrameRate: test.frameRate, Bitrate: test.bitrate, BitDepth: test.bitDepth,
+				VideoRange: "SDR", VideoRangeType: "SDR",
+			}
+
+			req := validStartRequestV3()
+			req.ClientFeatures = append(req.ClientFeatures, FeatureSoftwareVideoDecodeV3)
+			req.Capabilities.VideoEvidence = EvidencePlatformAttestedV3
+			req.Capabilities.CodecsVideo = []string{test.codec}
+			req.Capabilities.CodecsVideoHardware = nil
+			req.Capabilities.Containers = []string{"mkv"}
+			req.Capabilities.MaxResolution = "1080p"
+			req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{
+				Codec: test.codec, Profiles: []string{test.claimedProfile}, BitDepths: []int{test.bitDepth},
+				MaxWidth: test.width, MaxHeight: test.height, MaxFrameRate: float64(test.maxFrameRate),
+				MaxBitrateKbps: test.maxBitrate, Hardware: false,
+			}}
+			original := req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
+			original.Containers = []string{"mkv"}
+			original.VideoCodecs = []string{test.codec}
+			original.AudioDecodeCodecs = []string{"aac"}
+			req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3] = original
+
+			result := PlanPlaybackV3(PlannerInputV3{
+				Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+				Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true},
+				Registry: testTransformationRegistryV3(),
+			})
+			if result.Plan == nil || result.Plan.Delivery != DeliveryOriginalHTTPV3 {
+				t.Fatalf("final Apple software envelope = %s", ExplainPlannerResultV3(result))
+			}
+		})
+	}
+}
+
+func TestPlanPlaybackV3ApplePackagedCodecListsExcludeSoftwareOnlyCopy(t *testing.T) {
+	file := detailedFixtureFileV3()
+	file.CodecVideo = "vp9"
+	file.Resolution = "1080p"
+	file.Bitrate = 2_600
+	file.VideoTracks[0] = models.VideoTrack{Codec: "vp9", Profile: "Profile 0", Width: 1920, Height: 1080, FrameRate: "24", Bitrate: 2_600, BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR"}
+
+	req := validStartRequestV3()
+	req.ClientFeatures = append(req.ClientFeatures, FeatureSoftwareVideoDecodeV3)
+	req.Capabilities.VideoEvidence = EvidencePlatformAttestedV3
+	req.Capabilities.CodecsVideo = []string{"vp9"}
+	req.Capabilities.CodecsVideoHardware = nil
+	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{Codec: "vp9", Profiles: []string{"profile 0"}, BitDepths: []int{8}, MaxWidth: 1920, MaxHeight: 1080, MaxFrameRate: 30, MaxBitrateKbps: 3_000, Hardware: false}}
+	original := req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
+	original.Enabled = false
+	req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3] = original
+	for _, delivery := range []string{DeliveryClassProgressiveV3, DeliveryClassHLSV3} {
+		packaged := req.ClientPlaybackContext.Deliveries[delivery]
+		packaged.VideoCodecs = []string{"h264"}
+		packaged.AudioDecodeCodecs = []string{"aac"}
+		req.ClientPlaybackContext.Deliveries[delivery] = packaged
+	}
+
+	result := PlanPlaybackV3(PlannerInputV3{
+		Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+		Settings: PlannerSettingsV3{TranscodeEnabled: true}, Registry: testTransformationRegistryV3(),
+	})
+	if result.Plan == nil || result.Plan.Delivery != DeliveryTranscodeHLSV3 || result.TargetVideoCodec != "h264" {
+		t.Fatalf("software-only source leaked into a packaged copy route: %s", ExplainPlannerResultV3(result))
 	}
 }
 

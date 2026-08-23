@@ -105,7 +105,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 	// ?seek= query for remux), so no runtime beyond the Session needs rebuilding.
 	// Without a token (or signing secret) reconstruct is off, collapsing to a
 	// plain GetSession + ownership check.
-	card := streamCardFromToken(r.URL.Query().Get(streamTokenParam), sessionID, h.JWTSecret)
+	card, claims := verifiedStreamCardFromToken(r.URL.Query().Get(streamTokenParam), sessionID, h.JWTSecret)
 	session, status := h.TM.LoadOrReconstructSession(r.Context(), h.sessionMgr.GetSession, sessionID, userID, card)
 	switch status {
 	case playback.SessionMissing:
@@ -116,6 +116,12 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	case playback.SessionForbidden:
 		writeError(w, http.StatusForbidden, "forbidden", "Session belongs to another user")
+		return
+	case playback.SessionUnauthorized:
+		// Defensive against invariant drift, not a reachable path: this caller
+		// resolves a non-zero user before loading. Falling through would
+		// dereference the nil session the status carries.
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required")
 		return
 	}
 
@@ -141,6 +147,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		writePlaybackFilePreflightError(w, err)
 		return
 	}
+	attachPlaybackSession(r.Context(), session, claims)
 
 	switch session.PlayMethod {
 	case playback.PlayDirect:
@@ -224,6 +231,7 @@ func (h *StreamHandler) HandleSubtitle(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "forbidden", "Session belongs to another user")
 		return
 	}
+	attachPlaybackSession(r.Context(), session, nil)
 
 	fileID, err := subtitleSourceFileID(r, session)
 	if err != nil {
@@ -490,6 +498,7 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusForbidden, "forbidden", "Session belongs to another user")
 		return
 	}
+	attachPlaybackSession(r.Context(), session, nil)
 
 	fileID, err := subtitleSourceFileID(r, session)
 	if err != nil {
