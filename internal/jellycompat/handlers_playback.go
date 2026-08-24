@@ -955,6 +955,7 @@ func buildMediaStreamsWithSelection(routeItemID, mediaSourceID string, version c
 		if bitrate == 0 && version.Bitrate > 0 {
 			bitrate = version.Bitrate * 1000
 		}
+		anamorphic, anamorphicKnown := compatIsAnamorphic(track)
 		streams = append(streams, mediaStreamDTO{
 			Index:                  index,
 			Type:                   "Video",
@@ -970,7 +971,7 @@ func buildMediaStreamsWithSelection(routeItemID, mediaSourceID string, version c
 			SupportsExternalStream: false,
 			IsInterlaced:           track.Interlaced,
 			IsAVC:                  strings.EqualFold(track.Codec, "h264"),
-			IsAnamorphic:           false,
+			IsAnamorphic:           anamorphicKnown && anamorphic,
 			NalLengthSize:          "4",
 			BitDepth:               track.BitDepth,
 			RefFrames:              track.ReferenceFrames,
