@@ -46,14 +46,33 @@ const (
 	// origin, so every byte egresses from the API server; with it the plan may
 	// hand out credential-free proxy origins and distributed egress is restored.
 	FeatureAuthorizedMediaOriginsV3 = "authorized_media_origins_v1"
-	PlanRecipeVersionV3             = "v3.4"
-	ClientDV7ToDV81V3               = "client_dv7_to_dv81"
-	ClientDV7ToHDR10V3              = "client_dv7_to_hdr10"
-	ClientDVTransformVersionV3      = "1"
-	ClientDV8HDR10PlusSanitizerV3   = "client_dv8_hdr10plus_sanitizer_v1"
-	ClientPostResumeRecoveryV3      = "client_post_resume_video_recovery_v1"
-	ClientSurfaceRecoveryV3         = "client_surface_recovery_v1"
-	DeviceQuirkRegistryRevisionV3   = "2026-07-13.1"
+	// FeaturePlanInvalidatedV3 is the client's promise to handle the realtime
+	// plan_invalidated command: ack it, replan off the named plan with operation
+	// failure_recovery and the invalidated plan's attempt key in
+	// attempted_plan_keys, then report the result.
+	//
+	// It exists because the server may only learn a route is wrong after the
+	// plan is already playing — the H.264 copy-safety scan now runs
+	// asynchronously so playback never waits on it. A session that did not
+	// negotiate the token, or has no realtime connection, is stopped instead;
+	// the client's ordinary recovery then mints a fresh attempt that plans
+	// against the now-persisted verdict.
+	FeaturePlanInvalidatedV3   = "plan_invalidated_v1"
+	PlanRecipeVersionV3        = "v3.4"
+	ClientDV7ToDV81V3          = "client_dv7_to_dv81"
+	ClientDV7ToHDR10V3         = "client_dv7_to_hdr10"
+	ClientDVTransformVersionV3 = "1"
+	// ClaimClientManagedDynamicRangeV3 is scoped to the original_http
+	// delivery. A client that advertises it accepts responsibility for mapping
+	// any source dynamic range it declares decodable onto the active output;
+	// the server must not require native sink-HDR support before delivering the
+	// original bytes. Packaged server deliveries remain output-gated.
+	ClaimClientManagedDynamicRangeV3 = "client_managed_dynamic_range_v1"
+	ClaimClientSelectedAudioTrackV3  = "client_selected_audio_track_v1"
+	ClientDV8HDR10PlusSanitizerV3    = "client_dv8_hdr10plus_sanitizer_v1"
+	ClientPostResumeRecoveryV3       = "client_post_resume_video_recovery_v1"
+	ClientSurfaceRecoveryV3          = "client_surface_recovery_v1"
+	DeviceQuirkRegistryRevisionV3    = "2026-07-13.1"
 )
 
 // ServerFeaturesV3 returns the complete feature set advertised by protocol-v3
@@ -72,6 +91,7 @@ func ServerFeaturesV3() []string {
 		FeatureHeaderAuthenticatedMediaV3,
 		FeatureAuthorizedMediaOriginsV3,
 		FeatureSoftwareVideoDecodeV3,
+		FeaturePlanInvalidatedV3,
 		// Advertised so a client can tell "this server does not populate
 		// source.duration_seconds" apart from "this server knows the runtime
 		// is genuinely unknown". Without the distinction both look like an
@@ -151,6 +171,7 @@ const (
 	DynamicRangeHDR10PlusV3   = "hdr10_plus"
 	DynamicRangeHLGV3         = "hlg"
 	DynamicRangeDolbyVisionV3 = "dolby_vision"
+	DynamicRangeHDRUnknownV3  = "hdr_unknown"
 )
 
 // Server transformation names. A plan names the transformations its serving

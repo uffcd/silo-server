@@ -55,6 +55,11 @@ type SessionManagerInterface interface {
 	TouchActivity(sessionID string) error
 	BeginTransport(sessionID string) error
 	EndTransport(sessionID string) error
+	// WatchTransportStop is required rather than probed for at run time: it is
+	// the only thing that can interrupt a single-response transport, so an
+	// implementation without it would serve progressive remuxes that no session
+	// stop can withdraw.
+	WatchTransportStop(sessionID string) (<-chan struct{}, func())
 	SetRemoteTransport(sessionID string, remote bool) error
 	SetEffectiveMediaFileID(sessionID string, fileID int) error
 	SetTranscodeNodeURL(sessionID, url string) error
@@ -123,8 +128,35 @@ type PlaybackFileVersionFetcher interface {
 	GetByEpisodeID(ctx context.Context, episodeID string) ([]*models.MediaFile, error)
 }
 
+// PlaybackProbeEnsurer repairs probe metadata and stamps the H.264 copy-safety
+// verdict when it is already known.
+//
+// It deliberately exposes no blocking variant: a play must never wait on the
+// multi-second bitstream scan, so an unknown verdict is planned optimistically
+// and resolved behind the play (see PlaybackCopySafetyRacer).
+//
+// EnsureProbeOnly is declared because this interface is also the type the
+// router carries the shared ensurer in when handing it to the catalog and
+// chapter-thumbnail services, which repair probe metadata and nothing else.
 type PlaybackProbeEnsurer interface {
-	Ensure(ctx context.Context, file *models.MediaFile) (*models.MediaFile, error)
+	EnsureProbeOnly(ctx context.Context, file *models.MediaFile) (*models.MediaFile, error)
+	EnsureCopySafetyCached(ctx context.Context, file *models.MediaFile) (*models.MediaFile, error)
+}
+
+// PlaybackCopySafetyRacer resolves an unknown H.264 copy-safety verdict out of
+// band, after a plan that stream-copies video has already been issued.
+// *playback.CopySafetyRace implements it.
+type PlaybackCopySafetyRacer interface {
+	RaceScanForPlan(fileID int, plan *playback.PlanV3)
+	// RaceScan re-engages the race for a file whose verdict is still open. The
+	// serve paths use it when they revive a stream-copy transport: the replica
+	// that planned it may be gone, and only a race running *here* can withdraw
+	// the route from the session this replica just rebuilt.
+	RaceScan(fileID int)
+	// VideoCopyUnsafeKnown answers, without ffmpeg and without waiting, whether
+	// this replica can already condemn a video stream-copy of the file —
+	// including from a verdict whose write to the row failed.
+	VideoCopyUnsafeKnown(ctx context.Context, file *models.MediaFile) bool
 }
 
 type PlaybackChapterThumbnailQueuer interface {
@@ -172,14 +204,18 @@ type PlaybackHandler struct {
 	// relayed request has nothing to reconstruct from. Optional and best effort:
 	// without it (or without Redis behind it) such a session replans instead of
 	// recovering, exactly as before.
-	NodeRecipeStore        recipeCardStoreV3
-	ItemAccess             PlaybackItemAccessChecker // optional; enables file authorization checks
-	EpisodeLookup          PlaybackEpisodeLookup     // optional; resolves episode files to their series
-	ExtraLookup            PlaybackExtraLookup       // optional; resolves extras files to their parent item
-	OriginalLangLookup     PlaybackOriginalLanguageLookup
-	SettingsRepo           PlaybackSettingsReader     // optional; reads server settings (e.g., allow_4k_transcode)
-	FileVersionFetcher     PlaybackFileVersionFetcher // optional; queries sibling file versions for 4K guard
-	ProbeEnsurer           PlaybackProbeEnsurer       // optional; repairs missing probe metadata on demand
+	NodeRecipeStore    recipeCardStoreV3
+	ItemAccess         PlaybackItemAccessChecker // optional; enables file authorization checks
+	EpisodeLookup      PlaybackEpisodeLookup     // optional; resolves episode files to their series
+	ExtraLookup        PlaybackExtraLookup       // optional; resolves extras files to their parent item
+	OriginalLangLookup PlaybackOriginalLanguageLookup
+	SettingsRepo       PlaybackSettingsReader     // optional; reads server settings (e.g., allow_4k_transcode)
+	FileVersionFetcher PlaybackFileVersionFetcher // optional; queries sibling file versions for 4K guard
+	ProbeEnsurer       PlaybackProbeEnsurer       // optional; repairs missing probe metadata on demand
+	// CopySafetyRacer resolves an unknown H.264 copy-safety verdict behind an
+	// already-issued stream-copy plan. Optional: without it an unknown verdict
+	// simply stays unknown and the copy route is never withdrawn.
+	CopySafetyRacer        PlaybackCopySafetyRacer
 	ChapterThumbnailQueuer PlaybackChapterThumbnailQueuer
 	IntroAnalyzer          IntroEpisodeAnalyzer
 	IntroRepository        PlaybackIntroEligibilityChecker
@@ -383,11 +419,16 @@ func semanticPlayMethod(s *playback.Session) playback.PlayMethod {
 	return s.PlayMethod
 }
 
+// ensurePlaybackProbe repairs probe metadata and stamps the H.264 copy-safety
+// verdict when it is already known. It never runs the bitstream scan: an
+// unknown verdict plans optimistically (the planner reads nil MultiplePPS as
+// "copy is allowed") and is resolved asynchronously once the plan is issued, so
+// starting playback never waits on a multi-second read of the source.
 func (h *PlaybackHandler) ensurePlaybackProbe(ctx context.Context, file *models.MediaFile) *models.MediaFile {
 	if h == nil || h.ProbeEnsurer == nil || file == nil {
 		return file
 	}
-	repaired, err := h.ProbeEnsurer.Ensure(ctx, file)
+	repaired, err := h.ProbeEnsurer.EnsureCopySafetyCached(ctx, file)
 	if err != nil {
 		slog.WarnContext(ctx, "playback probe repair failed", "component", "api", "file_id", file.ID, "path", file.FilePath, "error", err)
 		return file
@@ -475,6 +516,18 @@ func (h *PlaybackHandler) loadTranscodeServeSession(r *http.Request, sessionID s
 	// Genuine miss (e.g. after a restart): now — and only now — pay for the token
 	// decode so the recipe is available for reconstruction.
 	card, claims := verifiedStreamCardFromToken(r.URL.Query().Get(streamTokenParam), sessionID, h.JWTSecret)
+	// The copy-safety verdict gates the revival before it happens, not after.
+	// Reconstruction registers the playback session against the user's stream
+	// caps, so a refusal that ran later would leave a session nobody serves
+	// holding an admission slot the client's fresh attempt needs — and a
+	// remote-node recipe never reaches the local transport reconstruct at all
+	// (the serve handlers proxy to the node instead), so a gate down there would
+	// miss it entirely. A revival the verdict does not condemn re-engages the
+	// race here, so the session about to be rebuilt is covered by a race this
+	// replica owns. See playback_copy_safety.go.
+	if videoCopyReconstructRefused(r.Context(), h.fileResolver, h.CopySafetyRacer, card) {
+		return nil, playback.SessionMissing, nil, nil
+	}
 	session, status := h.tm.LoadOrReconstructSession(r.Context(), h.sessionMgr.GetSession, sessionID, requestUserID, card)
 	return session, status, card, claims
 }
@@ -1408,11 +1461,7 @@ func (h *PlaybackHandler) HandleGetTranscodeManifest(w http.ResponseWriter, r *h
 		// Local transcode whose process state was lost: reconstruct it from the
 		// token recipe. The manifest path has no segment context, so pass -1 (use
 		// the token's seek position).
-		if card == nil {
-			writeError(w, http.StatusNotFound, "not_found", "Transcode session not found")
-			return
-		}
-		transcodeSession = h.tm.ReconstructTranscode(r.Context(), sessionID, -1, *card)
+		transcodeSession = h.reconstructTransportForServe(r.Context(), sessionID, -1, card)
 		if transcodeSession == nil {
 			writeError(w, http.StatusNotFound, "not_found", "Transcode session not found")
 			return
@@ -1472,11 +1521,7 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 		if segNum, parseErr := playback.ParseSegmentNumber(chi.URLParam(r, "name")); parseErr == nil {
 			requestedSegment = segNum
 		}
-		if card == nil {
-			writeError(w, http.StatusNotFound, "not_found", "Transcode session not found")
-			return
-		}
-		transcodeSession = h.tm.ReconstructTranscode(r.Context(), sessionID, requestedSegment, *card)
+		transcodeSession = h.reconstructTransportForServe(r.Context(), sessionID, requestedSegment, card)
 		if transcodeSession == nil {
 			writeError(w, http.StatusNotFound, "not_found", "Transcode session not found")
 			return

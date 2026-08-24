@@ -246,10 +246,21 @@ func containsStr(slice []string, s string) bool {
 // bitstream scan (H.264 sources that redefine a pic_parameter_set_id in-band
 // with conflicting content). Scan failures also disable copy for the current
 // decision while remaining eligible for retry on a later request.
+//
+// The track flags are runtime-only: they are stamped by the probe ensurer,
+// which only the playback start path and the watch surfaces run. The verdict
+// persisted on the media_files row carries the same answer and is present on
+// every repository read, so it is honored directly — a replan, a
+// Jellyfin-protocol route decision, and a fresh start must all reach the same
+// conclusion about the same file.
 func videoCopyUnsafeFile(file *models.MediaFile) bool {
 	if file == nil || len(file.VideoTracks) == 0 {
 		return false
 	}
 	track := file.VideoTracks[0]
-	return track.VideoCopyUnsafe || (track.MultiplePPS != nil && *track.MultiplePPS)
+	if track.VideoCopyUnsafe || (track.MultiplePPS != nil && *track.MultiplePPS) {
+		return true
+	}
+	multi, known := file.PersistedVideoCopyVerdict()
+	return known && multi
 }

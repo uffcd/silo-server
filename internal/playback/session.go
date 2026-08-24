@@ -257,6 +257,9 @@ type SessionManager struct {
 	activeGrace      time.Duration
 	pausedGrace      time.Duration
 	expireHook       func(*Session)
+	// transportStops holds the stop channels of media transports this replica
+	// is currently serving, keyed by session ID. See WatchTransportStop.
+	transportStops map[string]map[chan struct{}]struct{}
 }
 
 // SessionLimits stores per-user admission limits. Zero values mean unlimited.
@@ -1270,7 +1273,87 @@ func (m *SessionManager) EndTransport(sessionID string) error {
 	return nil
 }
 
-// StopSession removes a session from the manager.
+// WatchTransportStop returns a channel that is closed when the session is
+// stopped, and the release the caller must run when its transport ends.
+//
+// A progressive remux is a single HTTP response whose ffmpeg is owned by the
+// serving handler and canceled only by that request's context, so removing the
+// session from this manager does not reach it: an unnegotiated client would go
+// on consuming a stream the server has already disowned — for a copy-unsafe
+// source, corrupt bytes its decoder cannot recover from. This is the smallest
+// handle that lets a stop interrupt one. Segmented transports (HLS, transcode)
+// do not need it: each of their requests is short, and the next one is refused
+// once the session is gone.
+//
+// A session that is already gone yields an immediately-closed channel. The stop
+// that removed it has run and will never run again, so a watcher registered
+// after it would be closed by nobody: the caller's BeginTransport can succeed
+// and the session be stopped before the registration lands, and the progressive
+// remux that hole leaves behind runs to EOF serving bytes the server disowned.
+// Reporting the stop it missed collapses that race into the ordinary path.
+//
+// The channel is closed at most once: StopSession takes the whole watcher set
+// out of the map under the lock before closing it, and release drops a watcher
+// that was never signaled.
+func (m *SessionManager) WatchTransportStop(sessionID string) (<-chan struct{}, func()) {
+	if m == nil || sessionID == "" {
+		return nil, func() {}
+	}
+
+	stop := make(chan struct{})
+	m.mu.Lock()
+	if _, live := m.sessions[sessionID]; !live {
+		m.mu.Unlock()
+		close(stop)
+		return stop, func() {}
+	}
+	if m.transportStops == nil {
+		m.transportStops = make(map[string]map[chan struct{}]struct{})
+	}
+	watchers, ok := m.transportStops[sessionID]
+	if !ok {
+		watchers = make(map[chan struct{}]struct{})
+		m.transportStops[sessionID] = watchers
+	}
+	watchers[stop] = struct{}{}
+	m.mu.Unlock()
+
+	var once sync.Once
+	return stop, func() {
+		once.Do(func() { m.releaseTransportStop(sessionID, stop) })
+	}
+}
+
+func (m *SessionManager) releaseTransportStop(sessionID string, stop chan struct{}) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	watchers, ok := m.transportStops[sessionID]
+	if !ok {
+		return
+	}
+	delete(watchers, stop)
+	if len(watchers) == 0 {
+		delete(m.transportStops, sessionID)
+	}
+}
+
+// stopTransportsLocked signals every transport registered for the session. The
+// close is cheap and never blocks, and the watchers it wakes cancel an ffmpeg
+// rather than calling back into the manager, so it is safe to do under the lock.
+func (m *SessionManager) stopTransportsLocked(sessionID string) {
+	watchers, ok := m.transportStops[sessionID]
+	if !ok {
+		return
+	}
+	delete(m.transportStops, sessionID)
+	for stop := range watchers {
+		close(stop)
+	}
+}
+
+// StopSession removes a session from the manager and interrupts any media
+// transport it is still serving.
 func (m *SessionManager) StopSession(sessionID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1280,6 +1363,7 @@ func (m *SessionManager) StopSession(sessionID string) error {
 	}
 
 	delete(m.sessions, sessionID)
+	m.stopTransportsLocked(sessionID)
 	return nil
 }
 

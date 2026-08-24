@@ -860,6 +860,7 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 		h.ChapterThumbnailQueuer.QueuePriorityFileAtPosition(r.Context(), effectiveFile.ID, session.Position)
 	}
 	h.maybeQueueLazyPlaybackMarkers(r.Context(), session, effectiveFile)
+	h.raceCopySafetyV3(effectiveFile.ID, result.Plan)
 	h.persistSeriesSelectionsV3(r.Context(), userID, profileID, effectiveFile, plannedAudioTrackIndexV3(result, audioIndex))
 	h.syncSessionsNow(r.Context(), "v3_start")
 	h.enqueueRouteEventV3(playback.RouteEventRecordV3{RouteEventV3: playback.RouteEventV3{ProtocolVersion: playback.ProtocolV3, PlaybackAttemptID: req.PlaybackAttemptID, SessionID: session.ID, PlanID: result.Plan.PlanID, Event: playback.RouteEventPlanSelectedV3, AppliedQuirkIDs: appliedQuirkIDsV3(result.Plan), QuirkRegistryRevision: appliedQuirkRevisionV3(result.Plan), OutputContextID: req.ClientPlaybackContext.Output.OutputContextID}, UserID: userID, ProfileID: profileID, ClientName: clientInfo.Name, ClientVersion: clientInfo.Version, ClientBuild: clientInfo.Build, ClientChannel: clientInfo.Channel, ClientModel: req.ClientPlaybackContext.Device.Model})
@@ -2300,7 +2301,19 @@ func (h *PlaybackHandler) HandleReplanPlaybackV3(w http.ResponseWriter, r *http.
 			transport.afterDurableCommit()
 		}
 	}
+	h.raceCopySafetyV3(updated.EffectiveMediaFileID, response.PlaybackPlan)
 	writeJSON(w, http.StatusOK, response)
+}
+
+// raceCopySafetyV3 resolves an unknown H.264 copy-safety verdict behind a plan
+// that stream-copies video. It is called after the durable commit on both the
+// start and replan paths, so the scan only ever chases a route a client was
+// actually handed, and it returns immediately — no response waits on it.
+func (h *PlaybackHandler) raceCopySafetyV3(fileID int, plan *playback.PlanV3) {
+	if h == nil || h.CopySafetyRacer == nil || fileID <= 0 || plan == nil {
+		return
+	}
+	h.CopySafetyRacer.RaceScanForPlan(fileID, plan)
 }
 
 func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.AttemptRecordV3, req playback.ReplanRequestV3) (playback.DecisionResponseV3, playback.AttemptRecordV3, *preparedTransportV3, *transportErrorV3) {

@@ -1,6 +1,7 @@
 package playback
 
 import (
+	"strings"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/streamtoken"
@@ -159,6 +160,18 @@ func NewRemuxRecipeCard(sessionID string, userID int, profileID string, mediaFil
 		RemuxDVMode:     mode,
 		AudioTrackIndex: audioTrackIndex,
 	}
+}
+
+// VideoStreamCopy reports whether this recipe delivers the source video
+// bitstream without re-encoding it: a progressive remux, or an HLS transport
+// whose video target was pinned to an explicit copy. Those are exactly the
+// routes an H.264 multi-PPS verdict disqualifies — a real transcode re-encodes
+// the bitstream and is unaffected by conflicting in-band parameter sets.
+func (c RecipeCard) VideoStreamCopy() bool {
+	if c.PlayMethod == PlayRemux {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(c.TargetCodecVideo), "copy")
 }
 
 // TranscodeOpts rebuilds the encode parameters for a reconstruct. outputDir,
