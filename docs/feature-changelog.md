@@ -1,5 +1,10 @@
 # Feature Changelog
 
+## 2026-08-25
+
+### Clear stale library troubleshooting entries after path changes
+Full library scans now reconcile troubleshooting entries across the whole library, so diagnostics for removed or replaced root paths disappear after the path-change scan completes. Subtree and single-file scans remain scoped and cannot clear diagnostics elsewhere in the library.
+
 ## 2026-08-24
 
 ### Start audiobook playback once after browser capability detection
