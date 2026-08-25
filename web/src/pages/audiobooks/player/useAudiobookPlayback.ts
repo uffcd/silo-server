@@ -218,6 +218,8 @@ export function useAudiobookPlayback({
   // against `audio/mp4` as well as `video/mp4`, so an audio-only source is
   // described honestly without a second detection path.
   const capabilityProbe = useCodecDetection();
+  const capabilitiesSettled = capabilityProbe.settled;
+  const [initialCapabilitiesSettled, setInitialCapabilitiesSettled] = useState(capabilitiesSettled);
   const clientCapabilities = useMemo(
     () => buildClientCapabilitiesV3(capabilityProbe),
     [capabilityProbe],
@@ -277,6 +279,10 @@ export function useAudiobookPlayback({
   // Wall-clock time playback last paused, for smart rewind on resume. Cleared
   // by explicit seeks so a hand-picked position is never second-guessed.
   const pausedAtRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (capabilitiesSettled) setInitialCapabilitiesSettled(true);
+  }, [capabilitiesSettled]);
 
   useEffect(() => {
     // Output probes can settle after playback starts (for example, the async
@@ -541,6 +547,7 @@ export function useAudiobookPlayback({
       playbackAttemptIdRef.current = null;
       return;
     }
+    if (!initialCapabilitiesSettled) return;
 
     let canceled = false;
     let startedSessionId: string | null = null;
@@ -640,7 +647,15 @@ export function useAudiobookPlayback({
         planRef.current = null;
       }
     };
-  }, [activePart, adoptPlan, config, fileId, sourceRevision, stopSession]);
+  }, [
+    activePart,
+    adoptPlan,
+    initialCapabilitiesSettled,
+    config,
+    fileId,
+    sourceRevision,
+    stopSession,
+  ]);
 
   useEffect(() => {
     const audio = audioRef.current;

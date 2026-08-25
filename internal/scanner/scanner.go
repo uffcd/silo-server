@@ -2779,20 +2779,20 @@ func (s *Scanner) processFile(
 				FilePath:      filePath,
 			}
 			populateScanIdentity(&mf, filePath, folder.Type, assignment, groupAssignment, existing)
-			switch id, updErr := s.fileRepo.UpdateIdentity(ctx, mf); {
-			case updErr == nil:
-				mf.ID = id
-				if err := s.enqueueMetadataWork(ctx, folder, &mf); err != nil {
-					return 0, nil, fmt.Errorf("enqueueing metadata work for file %s: %w", filePath, err)
-				}
+			applied, persistErr := persistIdentityUpdate(&mf,
+				func(file models.MediaFile) (int, error) { return s.fileRepo.UpdateIdentity(ctx, file) },
+				func(file *models.MediaFile) error { return s.enqueueMetadataWork(ctx, folder, file) },
+			)
+			switch {
+			case persistErr != nil:
+				return 0, nil, fmt.Errorf("persisting identity update for file %s: %w", filePath, persistErr)
+			case applied:
 				return actionUpdated, updateReasons, nil
-			case errors.Is(updErr, ErrFileNotFound):
+			default:
 				// The row vanished between the scan-state snapshot and this
 				// write (concurrent delete). Fall through to the full path,
 				// whose upsert re-ingests the file in this scan — the old
 				// behavior before the fast path existed.
-			default:
-				return 0, nil, fmt.Errorf("updating identity for file %s: %w", filePath, updErr)
 			}
 		}
 
@@ -2803,6 +2803,32 @@ func (s *Scanner) processFile(
 
 		// Try to get probe data.
 		probe, probeSource := s.probeFile(ctx, filePath)
+		if shouldPreserveExistingProbeAfterProbeFailure(updateReasons, probe) {
+			// Leave the migrated row's probe_updated_at NULL so a later scan
+			// retries without replacing valid metadata with zero values.
+			if len(updateReasons) > 1 {
+				mf := models.MediaFile{MediaFolderID: folder.ID, FilePath: filePath}
+				populateScanIdentity(&mf, filePath, folder.Type, assignment, groupAssignment, existing)
+				mf.ExternalSubtitles = externalSubtitleModels(loadExternalSubs())
+				applied, persistErr := persistIdentityUpdate(&mf,
+					func(file models.MediaFile) (int, error) {
+						return s.fileRepo.UpdateIdentityAndExternalSubtitles(ctx, file)
+					},
+					func(file *models.MediaFile) error { return s.enqueueMetadataWork(ctx, folder, file) },
+				)
+				switch {
+				case persistErr != nil:
+					return 0, nil, fmt.Errorf("persisting identity update for file %s: %w", filePath, persistErr)
+				case applied:
+					return actionUpdated, updateReasons, nil
+				default:
+					// The old row is gone, so there is no probe metadata left to
+					// preserve. Continue through the normal upsert path.
+				}
+			} else {
+				return actionUnchanged, updateReasons, nil
+			}
+		}
 
 		// Detect external subtitles.
 		externalSubs = loadExternalSubs()
@@ -2833,20 +2859,7 @@ func (s *Scanner) processFile(
 			mf.SubtitleTracks = []models.SubtitleTrack{}
 		}
 
-		modelExternalSubs := make([]models.ExternalSubtitle, len(externalSubs))
-		for i, es := range externalSubs {
-			modelExternalSubs[i] = models.ExternalSubtitle{
-				Path:     es.Path,
-				Language: es.Language,
-				Format:   es.Format,
-				Title:    es.Title,
-				Forced:   es.Forced,
-			}
-		}
-		mf.ExternalSubtitles = modelExternalSubs
-		if mf.ExternalSubtitles == nil {
-			mf.ExternalSubtitles = []models.ExternalSubtitle{}
-		}
+		mf.ExternalSubtitles = externalSubtitleModels(externalSubs)
 
 		upserted, upsertErr := s.fileRepo.Upsert(ctx, mf)
 		if upsertErr != nil {
@@ -3261,6 +3274,9 @@ func needsCriticalProbeRepairScanState(file *scanStateFile) bool {
 	if file == nil {
 		return true
 	}
+	if file.DVProvenanceCurrent != nil && !*file.DVProvenanceCurrent {
+		return true
+	}
 	if strings.TrimSpace(file.ProbeSource) == "" || file.ProbeUpdatedAt == nil {
 		return true
 	}
@@ -3302,6 +3318,53 @@ func needsCriticalProbeRepairScanState(file *scanStateFile) bool {
 		return true
 	}
 	return false
+}
+
+func shouldPreserveExistingProbeAfterProbeFailure(updateReasons []string, probe *ProbeData) bool {
+	if probe != nil || len(updateReasons) == 0 {
+		return false
+	}
+	foundRepair := false
+	for _, reason := range updateReasons {
+		switch reason {
+		case "probe_repair":
+			foundRepair = true
+		case "group_assignment_changed", "root_assignment_changed", "external_subtitle_changed", "external_subtitle_missing":
+		default:
+			return false
+		}
+	}
+	return foundRepair
+}
+
+func externalSubtitleModels(externalSubs []ExternalSubtitleInfo) []models.ExternalSubtitle {
+	result := make([]models.ExternalSubtitle, len(externalSubs))
+	for i, es := range externalSubs {
+		result[i] = models.ExternalSubtitle{
+			Path: es.Path, Language: es.Language, Format: es.Format,
+			Title: es.Title, Forced: es.Forced,
+		}
+	}
+	return result
+}
+
+func persistIdentityUpdate(
+	file *models.MediaFile,
+	update func(models.MediaFile) (int, error),
+	enqueue func(*models.MediaFile) error,
+) (bool, error) {
+	id, err := update(*file)
+	if errors.Is(err, ErrFileNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	file.ID = id
+	if err := enqueue(file); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 func (s *Scanner) enqueueMetadataWork(ctx context.Context, folder *models.MediaFolder, file *models.MediaFile) error {
@@ -3710,6 +3773,7 @@ func identityEvidenceEqual(existing, expected []byte) bool {
 	return reflect.DeepEqual(existingValue, expectedValue)
 }
 
+// applyProbeData copies normalized probe facts onto a media file.
 func applyProbeData(mf *models.MediaFile, probe *ProbeData, probeSource string) {
 	mf.CodecVideo = probe.CodecVideo
 	mf.CodecAudio = probe.CodecAudio
@@ -3727,32 +3791,36 @@ func applyProbeData(mf *models.MediaFile, probe *ProbeData, probeSource string) 
 	videoTracks := make([]models.VideoTrack, len(probe.VideoTracks))
 	for i, vt := range probe.VideoTracks {
 		videoTracks[i] = models.VideoTrack{
-			Title:              vt.Title,
-			Codec:              vt.Codec,
-			DolbyVision:        vt.DolbyVision,
-			DVProfile:          vt.DVProfile,
-			DVLevel:            vt.DVLevel,
-			DVBLCompatID:       vt.DVBLCompatID,
-			DVELPresent:        vt.DVELPresent,
-			DVEnhancementLayer: vt.DVEnhancementLayer,
-			HDR10Plus:          vt.HDR10Plus,
-			Profile:            vt.Profile,
-			Level:              vt.Level,
-			Width:              vt.Width,
-			Height:             vt.Height,
-			AspectRatio:        vt.AspectRatio,
-			Interlaced:         vt.Interlaced,
-			FrameRate:          vt.FrameRate,
-			Bitrate:            vt.Bitrate,
-			VideoRange:         vt.VideoRange,
-			VideoRangeType:     vt.VideoRangeType,
-			ColorRange:         vt.ColorRange,
-			ColorPrimaries:     vt.ColorPrimaries,
-			ColorSpace:         vt.ColorSpace,
-			ColorTransfer:      vt.ColorTransfer,
-			BitDepth:           vt.BitDepth,
-			PixelFormat:        vt.PixelFormat,
-			ReferenceFrames:    vt.ReferenceFrames,
+			Title:               vt.Title,
+			Codec:               vt.Codec,
+			DolbyVision:         vt.DolbyVision,
+			DVProfile:           vt.DVProfile,
+			DVLevel:             vt.DVLevel,
+			DVBLCompatID:        vt.DVBLCompatID,
+			DVConfigPresent:     vt.DVConfigPresent,
+			DVBLCompatIDPresent: vt.DVBLCompatIDPresent,
+			DVBLPresent:         vt.DVBLPresent,
+			DVRPUPresent:        vt.DVRPUPresent,
+			DVELPresent:         vt.DVELPresent,
+			DVEnhancementLayer:  vt.DVEnhancementLayer,
+			HDR10Plus:           vt.HDR10Plus,
+			Profile:             vt.Profile,
+			Level:               vt.Level,
+			Width:               vt.Width,
+			Height:              vt.Height,
+			AspectRatio:         vt.AspectRatio,
+			Interlaced:          vt.Interlaced,
+			FrameRate:           vt.FrameRate,
+			Bitrate:             vt.Bitrate,
+			VideoRange:          vt.VideoRange,
+			VideoRangeType:      vt.VideoRangeType,
+			ColorRange:          vt.ColorRange,
+			ColorPrimaries:      vt.ColorPrimaries,
+			ColorSpace:          vt.ColorSpace,
+			ColorTransfer:       vt.ColorTransfer,
+			BitDepth:            vt.BitDepth,
+			PixelFormat:         vt.PixelFormat,
+			ReferenceFrames:     vt.ReferenceFrames,
 		}
 	}
 	mf.VideoTracks = videoTracks
