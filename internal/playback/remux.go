@@ -119,10 +119,10 @@ const (
 // Apple-parity fallback for devices without a P7 decoder). Profile 8 RPUs
 // stay: the base layer is self-contained and DV clients can render it.
 func buildRemuxArgs(filePath, outputFormat string, seekSeconds float64, transcodeAudio bool, audioTrackIndex int, dvProfile int, tagSampleEntry, audioOnly bool) []string {
-	return buildRemuxArgsWithAudioV3(filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, dvProfile, tagSampleEntry, audioOnly, 0, 0)
+	return buildRemuxArgsWithAudioV3(filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, dvProfile, tagSampleEntry, audioOnly, 0, 0, 0)
 }
 
-func buildRemuxArgsWithAudioV3(filePath, outputFormat string, seekSeconds float64, transcodeAudio bool, audioTrackIndex int, dvProfile int, tagSampleEntry, audioOnly bool, targetAudioChannels, targetAudioBitrateKbps int) []string {
+func buildRemuxArgsWithAudioV3(filePath, outputFormat string, seekSeconds float64, transcodeAudio bool, audioTrackIndex int, dvProfile int, tagSampleEntry, audioOnly bool, sourceAudioChannels, targetAudioChannels, targetAudioBitrateKbps int) []string {
 	args := []string{
 		"-nostdin",
 		"-hide_banner",
@@ -211,6 +211,9 @@ func buildRemuxArgsWithAudioV3(filePath, outputFormat string, seekSeconds float6
 			"-ac", strconv.Itoa(channels),
 			"-b:a", strconv.Itoa(bitrateKbps)+"k",
 		)
+		if IsAudioToAACStereoDownmixV3(sourceAudioChannels, "aac", targetAudioChannels) {
+			args = appendStereoDownmixBoostArgs(args, sourceAudioChannels, channels)
+		}
 	} else {
 		args = append(args, "-c", "copy")
 	}
@@ -244,10 +247,10 @@ func StartRemux(ctx context.Context, filePath, outputFormat string, seekSeconds 
 // v3 callers must pass the configured playback path so the strip capability
 // promised by the planner's probe holds for the binary that actually runs.
 func StartRemuxWithDVMode(ctx context.Context, filePath, outputFormat string, seekSeconds float64, transcodeAudio bool, audioTrackIndex int, dvProfile int, mode RemuxDVMode, ffmpegPath string) (*RemuxSession, error) {
-	return startRemuxWithOptions(ctx, filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, dvProfile, mode, ffmpegPath, false, 0, 0)
+	return startRemuxWithOptions(ctx, filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, dvProfile, mode, ffmpegPath, false, 0, 0, 0)
 }
 
-func startRemuxWithOptions(ctx context.Context, filePath, outputFormat string, seekSeconds float64, transcodeAudio bool, audioTrackIndex int, dvProfile int, mode RemuxDVMode, ffmpegPath string, audioOnly bool, targetAudioChannels, targetAudioBitrateKbps int) (*RemuxSession, error) {
+func startRemuxWithOptions(ctx context.Context, filePath, outputFormat string, seekSeconds float64, transcodeAudio bool, audioTrackIndex int, dvProfile int, mode RemuxDVMode, ffmpegPath string, audioOnly bool, sourceAudioChannels, targetAudioChannels, targetAudioBitrateKbps int) (*RemuxSession, error) {
 	ctx, cancel := context.WithCancel(ctx)
 
 	bin := ResolveFFmpegPath(ffmpegPath)
@@ -302,7 +305,7 @@ func startRemuxWithOptions(ctx context.Context, filePath, outputFormat string, s
 		cancel()
 		return nil, fmt.Errorf("unknown remux Dolby Vision mode %q", mode)
 	}
-	args := buildRemuxArgsWithAudioV3(filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, effectiveProfile, tagSampleEntry, audioOnly, targetAudioChannels, targetAudioBitrateKbps)
+	args := buildRemuxArgsWithAudioV3(filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, effectiveProfile, tagSampleEntry, audioOnly, sourceAudioChannels, targetAudioChannels, targetAudioBitrateKbps)
 	cmd := exec.CommandContext(ctx, bin, args...)
 
 	stdout, err := cmd.StdoutPipe()
@@ -380,8 +383,11 @@ type RemuxServeOptions struct {
 	ContentType string
 	// AudioOnly permits the otherwise-mandatory video map to be absent.
 	AudioOnly bool
-	// TargetAudioChannels and TargetAudioBitrateKbps freeze the planned AAC
-	// output. Zero values retain the historical stereo 192 kbps behavior.
+	// SourceAudioChannels identifies a real surround-to-stereo conversion so an
+	// already-stereo source keeps its authored level. TargetAudioChannels and
+	// TargetAudioBitrateKbps freeze the planned AAC output. Zero target values
+	// retain the historical stereo 192 kbps behavior.
+	SourceAudioChannels    int
 	TargetAudioChannels    int
 	TargetAudioBitrateKbps int
 	// Abort ends the response early when it is closed. A progressive remux is
@@ -434,7 +440,7 @@ func ServeRemuxWithOptions(w http.ResponseWriter, r *http.Request, filePath, out
 		return err
 	}
 
-	session, err := startRemuxWithOptions(r.Context(), filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, dvProfile, mode, ffmpegPath, opts.AudioOnly, opts.TargetAudioChannels, opts.TargetAudioBitrateKbps)
+	session, err := startRemuxWithOptions(r.Context(), filePath, outputFormat, seekSeconds, transcodeAudio, audioTrackIndex, dvProfile, mode, ffmpegPath, opts.AudioOnly, opts.SourceAudioChannels, opts.TargetAudioChannels, opts.TargetAudioBitrateKbps)
 	if err != nil {
 		http.Error(w, "failed to start remux", http.StatusInternalServerError)
 		return err

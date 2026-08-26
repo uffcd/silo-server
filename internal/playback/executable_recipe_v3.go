@@ -22,6 +22,7 @@ type ExecutableRecipeV3 struct {
 	SourceVideoCodec            string                 `json:"source_video_codec,omitempty"`
 	SourceVideoProfile          string                 `json:"source_video_profile,omitempty"`
 	SourceVideoBitDepth         int                    `json:"source_video_bit_depth,omitempty"`
+	SourceAudioChannels         int                    `json:"source_audio_channels,omitempty"`
 	SoftwareVideoDecode         bool                   `json:"software_video_decode,omitempty"`
 	SourceDurationSeconds       float64                `json:"source_duration_seconds,omitempty"`
 	ToneMapPolicy               tonemap.Policy         `json:"tone_map_policy,omitempty"`
@@ -51,8 +52,9 @@ type ExecutableRecipeV3 struct {
 }
 
 const (
-	executableRecipeVersionLegacyV3 = 1
-	executableRecipeVersionV3       = 2
+	executableRecipeVersionLegacyV3      = 1
+	executableRecipeVersionV3            = 2
+	executableRecipeVersionSourceAudioV3 = 3
 )
 
 // FreezeExecutableRecipeV3 captures the byte-affecting facts from a planner result.
@@ -79,6 +81,7 @@ func FreezeExecutableRecipeV3(result PlannerResultV3) ExecutableRecipeV3 {
 		SourceVideoCodec:            sourceMetadata.VideoCodec,
 		SourceVideoProfile:          sourceMetadata.VideoProfile,
 		SourceVideoBitDepth:         sourceMetadata.VideoBitDepth,
+		SourceAudioChannels:         result.SourceAudioChannels,
 		SoftwareVideoDecode:         sourceMetadata.SoftwareVideoDecode,
 		SourceDurationSeconds:       sourceMetadata.DurationSeconds,
 		ToneMapPolicy:               result.ToneMapPolicy,
@@ -100,6 +103,9 @@ func FreezeExecutableRecipeV3(result PlannerResultV3) ExecutableRecipeV3 {
 	if recipe.hasVersion2Fields() {
 		recipe.Version = executableRecipeVersionV3
 	}
+	if recipe.hasVersion3Fields() {
+		recipe.Version = executableRecipeVersionSourceAudioV3
+	}
 	return recipe
 }
 
@@ -116,12 +122,17 @@ func (r ExecutableRecipeV3) hasVersion2Fields() bool {
 		r.ToneMapDVRPUPresent
 }
 
+func (r ExecutableRecipeV3) hasVersion3Fields() bool {
+	return r.SourceAudioChannels != 0
+}
+
 // Valid reports whether an executable recipe is complete and internally consistent.
 func (r ExecutableRecipeV3) Valid() bool {
-	if (r.Version != executableRecipeVersionLegacyV3 && r.Version != executableRecipeVersionV3) || r.PlanID == "" {
+	if (r.Version != executableRecipeVersionLegacyV3 && r.Version != executableRecipeVersionV3 && r.Version != executableRecipeVersionSourceAudioV3) || r.PlanID == "" || r.SourceAudioChannels < 0 {
 		return false
 	}
-	if r.Version == executableRecipeVersionLegacyV3 && r.hasVersion2Fields() {
+	if (r.Version == executableRecipeVersionLegacyV3 && r.hasVersion2Fields()) ||
+		(r.Version < executableRecipeVersionSourceAudioV3 && r.hasVersion3Fields()) {
 		return false
 	}
 	hasToneMapField := r.ToneMapPolicy != "" || r.ToneMapMode != "" || r.ToneMapSourceKind != "" || r.ToneMapRecipeVersion != "" || r.ToneMapPreflightRequired || !r.ToneMapSourceRevision.IsZero()
@@ -149,6 +160,7 @@ func (r ExecutableRecipeV3) PlannerResult(plan *PlanV3) PlannerResultV3 {
 		TranscodeAudio:           r.TranscodeAudio,
 		TargetVideoCodec:         r.TargetVideoCodec,
 		TargetAudioCodec:         r.TargetAudioCodec,
+		SourceAudioChannels:      r.SourceAudioChannels,
 		TargetAudioChannels:      r.TargetAudioChannels,
 		TargetAudioBitrateKbps:   r.TargetAudioBitrateKbps,
 		TargetResolution:         r.TargetResolution,

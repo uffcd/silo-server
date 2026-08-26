@@ -21,6 +21,7 @@ import {
   type DeliverySubtitleCapabilitiesV3,
   type HDRCapabilitiesV3,
 } from "./protocol-v3";
+import { isSafariBrowserV3 } from "./utils/hlsEngine";
 
 /** App version reported to the server for diagnostics. */
 const WEB_APP_VERSION = "web";
@@ -80,6 +81,8 @@ export interface WebCapabilityProbe {
   progressiveCodecsVideo: string[];
   /** Audio codec names the browser reported support for. */
   codecsAudio: string[];
+  /** Audio codecs supported specifically inside progressive MP4 delivery. */
+  progressiveCodecsAudio: string[];
   /** Best-effort screen-derived resolution ceiling. */
   maxResolution: string;
   /** Best-effort HDR display detection. */
@@ -145,6 +148,7 @@ function buildDeliveryCapability(
  */
 export function buildDeliveriesV3(
   probe: WebCapabilityProbe,
+  userAgent = typeof navigator !== "undefined" ? navigator.userAgent : "",
 ): Partial<Record<DeliveryClassV3, DeliveryCapabilityV3>> {
   const nonProgressiveHDRDetails: HDRCapabilitiesV3 = {
     ...probe.hdrDetails,
@@ -159,15 +163,17 @@ export function buildDeliveriesV3(
   delete nonProgressiveHDRDetails.hdr10_max_height;
   delete nonProgressiveHDRDetails.hdr10_max_frame_rate;
   delete nonProgressiveHDRDetails.hdr10_max_bitrate_kbps;
-  const progressiveHDRDetails = probe.nativeHLS ? nonProgressiveHDRDetails : probe.hdrDetails;
-  const hlsHDRDetails = probe.nativeHLS ? probe.hdrDetails : nonProgressiveHDRDetails;
-  const hlsVideoCodecs = probe.nativeHLS ? probe.progressiveCodecsVideo : probe.codecsVideo;
+  const nativeHLSPreferred = probe.nativeHLS && isSafariBrowserV3(userAgent);
+  const progressiveHDRDetails = nativeHLSPreferred ? nonProgressiveHDRDetails : probe.hdrDetails;
+  const hlsHDRDetails = nativeHLSPreferred ? probe.hdrDetails : nonProgressiveHDRDetails;
+  const hlsVideoCodecs = nativeHLSPreferred ? probe.progressiveCodecsVideo : probe.codecsVideo;
   return {
     original_http: buildDeliveryCapability(probe, {
       hdr_details: nonProgressiveHDRDetails,
     }),
     progressive: buildDeliveryCapability(probe, {
       video_codecs: probe.progressiveCodecsVideo,
+      audio_decode_codecs: probe.progressiveCodecsAudio,
       hdr_details: progressiveHDRDetails,
     }),
     hls: buildDeliveryCapability(probe, {
@@ -263,6 +269,9 @@ export function buildClientPlaybackContextV3(probe: WebCapabilityProbe): ClientP
       ...(Object.keys(platformDetails).length > 0 ? { platform_details: platformDetails } : {}),
     },
     output: { hdr_details: probe.hdrDetails },
-    deliveries: buildDeliveriesV3(probe),
+    deliveries: buildDeliveriesV3(
+      probe,
+      typeof navigator !== "undefined" ? navigator.userAgent : "",
+    ),
   };
 }

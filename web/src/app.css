@@ -1015,6 +1015,36 @@
     box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.05);
   }
 
+  /* Preserve glass hover color while fading a composited overlay
+     instead of repainting the backdrop-filtered element on every frame. */
+  .glass-hover {
+    position: relative;
+    isolation: isolate;
+    overflow: hidden;
+  }
+  .glass-hover::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: inherit;
+    background: var(--glass-hover-color);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity var(--duration-fast) var(--ease-default);
+    will-change: opacity;
+  }
+  .glass-hover:hover::before {
+    opacity: 1;
+  }
+  .glass-hover-surface {
+    /* 25% surface over the existing 40% glass equals the previous 55% hover. */
+    --glass-hover-color: color-mix(in srgb, var(--surface) 25%, transparent);
+  }
+  .glass-hover-accent {
+    --glass-hover-color: var(--accent);
+  }
+
   /* Less-transparent glass for small chips that sit over busy cover art
      (manga count/status pills) so the label stays legible. */
   .glass-chip {
@@ -1227,6 +1257,43 @@
   .media-card:hover {
     filter: brightness(1.1);
     transform: translateY(-4px);
+  }
+
+  /* Keep card actions visible by default for touch, keyboard-only, and older
+     browsers. When any connected precise pointer can hover, hide them until
+     the card itself is hovered. This deliberately uses a direct :hover
+     selector: Tailwind's group-hover variant is limited to the primary
+     pointer's (hover: hover) result, which can exclude Windows hybrid devices
+     even while an attached mouse is actively hovering the card. */
+  .media-card-action-trigger,
+  .media-card-play-trigger {
+    opacity: 1;
+  }
+  .media-card-play-trigger {
+    pointer-events: auto;
+  }
+  @media (any-hover: hover) and (any-pointer: fine) {
+    .group\/media:hover .media-card-hover-dim {
+      background-color: rgb(0 0 0 / 0.3);
+    }
+    .media-card-action-trigger,
+    .media-card-play-trigger {
+      opacity: 0;
+    }
+    .media-card-play-trigger {
+      pointer-events: none;
+    }
+    .group\/card:hover .media-card-action-trigger,
+    .media-card-action-trigger[data-state="open"],
+    .media-card-action-trigger:focus-visible,
+    .group\/media:hover .media-card-play-trigger,
+    .media-card-play-trigger:focus-visible {
+      opacity: 1;
+    }
+    .group\/media:hover .media-card-play-trigger,
+    .media-card-play-trigger:focus-visible {
+      pointer-events: auto;
+    }
   }
 
   /* Card image container with consistent rounded corners */
@@ -1902,27 +1969,6 @@
     background-color: var(--primary);
     border-radius: 9999px;
     transition: width var(--duration-normal) var(--ease-default);
-  }
-
-  /* ── Watched Badge ───────────────────────────────────────── */
-  /* Checkmark badge overlay on fully-watched media cards.
-     Position: absolute top-right of card.
-     Usage: <div class="relative">
-              <img ... />
-              <div class="watched-badge"><Check /></div>
-            </div>                                              */
-  .watched-badge {
-    position: absolute;
-    top: 0.5rem;
-    right: 0.5rem;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 1.5rem;
-    height: 1.5rem;
-    border-radius: 9999px;
-    background-color: var(--primary);
-    color: var(--primary-foreground);
   }
 
   /* ── Play Overlay ────────────────────────────────────────── */

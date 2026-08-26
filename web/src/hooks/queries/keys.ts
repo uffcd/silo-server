@@ -218,6 +218,7 @@ export const settingsKeys = {
   // their own key (effectiveSettingsQueryKey), so one invalidation of that
   // prefix covers every scope and batch.
   all: ["settings"] as const,
+  overlayConfig: () => ["settings", "overlay-config"] as const,
   plugins: () => ["settings", "plugins"] as const,
   pluginDetail: (installationId: number) => ["settings", "plugins", installationId] as const,
 };
@@ -265,7 +266,6 @@ export const sectionKeys = {
   all: ["sections"] as const,
   home: () => ["sections", "home"] as const,
   homeLayout: () => ["sections", "home", "layout"] as const,
-  homeRefreshSignal: () => ["sections", "home", "refresh-signal"] as const,
   homeItemsRoot: () => ["sections", "home", "items"] as const,
   homeItems: (sectionId: string) => ["sections", "home", "items", sectionId] as const,
   libraryRoot: () => ["sections", "library"] as const,
@@ -280,6 +280,12 @@ export const sectionKeys = {
     ["sections", "profile", scope, libraryId] as const,
   profileOverridesRaw: (scope: string, libraryId?: string) =>
     ["sections", "profile", scope, libraryId, "raw"] as const,
+};
+
+export const mediaSurfaceKeys = {
+  // Client-only signal: keep it outside sectionKeys so refreshing section data
+  // cannot reset the counter immediately before a mutation increments it.
+  refreshSignal: () => ["media-surfaces", "refresh-signal"] as const,
 };
 
 export const ratingKeys = {

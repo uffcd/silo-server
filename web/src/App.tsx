@@ -120,6 +120,7 @@ import {
 } from "@/pages/catalogSearchParams";
 import { buildLegacyWebhookSyncRedirectTarget } from "@/lib/webhookSync";
 import { toast } from "sonner";
+import { prewarmCodecDetection } from "@/player/hooks/useCodecDetection";
 
 /** Scrolls to top on pathname change (custom replacement for ScrollRestoration which requires data router). */
 function useScrollRestoration() {
@@ -642,6 +643,13 @@ function AdminRealtimeEventChannels() {
   return null;
 }
 
+function PlaybackCapabilityPrewarmer() {
+  useEffect(() => {
+    void prewarmCodecDetection();
+  }, []);
+  return null;
+}
+
 export default function App() {
   return (
     <BrowserRouter>
@@ -655,6 +663,7 @@ export default function App() {
                     <WatchPlaybackProvider>
                       <AudiobookPlaybackProvider>
                         <RealtimeEventsProvider>
+                          <PlaybackCapabilityPrewarmer />
                           <RealtimeEventChannels />
                           <ScrollRestorationManager />
                           <RouteAnnouncer />

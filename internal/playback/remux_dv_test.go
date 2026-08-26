@@ -38,9 +38,40 @@ func TestBuildRemuxArgsExcludesAttachedPictures(t *testing.T) {
 }
 
 func TestBuildRemuxArgsHonorsPlannedAACOutput(t *testing.T) {
-	args := buildRemuxArgsWithAudioV3("/book.m4b", "mp4", 0, true, -1, 0, false, true, 1, 96)
+	args := buildRemuxArgsWithAudioV3("/book.m4b", "mp4", 0, true, -1, 0, false, true, 2, 1, 96)
 	if !argsContainPair(args, "-ac", "1") || !argsContainPair(args, "-b:a", "96k") {
 		t.Fatalf("planned mono bitrate missing from remux args: %s", strings.Join(args, " "))
+	}
+}
+
+func TestBuildRemuxArgsBoostsOnlySurroundToStereoAAC(t *testing.T) {
+	const wantFilter = "aresample=out_chlayout=stereo,alimiter=level_in=2:limit=0.794328235:attack=5:release=50:level=false:latency=true"
+	tests := []struct {
+		name           string
+		transcodeAudio bool
+		sourceChannels int
+		targetChannels int
+		wantBoost      bool
+	}{
+		{name: "5.1 to stereo", transcodeAudio: true, sourceChannels: 6, targetChannels: 2, wantBoost: true},
+		{name: "7.1 to default stereo", transcodeAudio: true, sourceChannels: 8, targetChannels: 0, wantBoost: true},
+		{name: "stereo encode", transcodeAudio: true, sourceChannels: 2, targetChannels: 2},
+		{name: "unknown source", transcodeAudio: true, sourceChannels: 0, targetChannels: 2},
+		{name: "surround to mono", transcodeAudio: true, sourceChannels: 6, targetChannels: 1},
+		{name: "negative target resolves to ordinary stereo", transcodeAudio: true, sourceChannels: 6, targetChannels: -1},
+		{name: "noncanonical target resolves to ordinary stereo", transcodeAudio: true, sourceChannels: 6, targetChannels: 3},
+		{name: "surround preserved", transcodeAudio: true, sourceChannels: 6, targetChannels: 6},
+		{name: "audio copy", sourceChannels: 6, targetChannels: 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := buildRemuxArgsWithAudioV3("/movie.mkv", "mp4", 0, tt.transcodeAudio, -1, 0, false, false, tt.sourceChannels, tt.targetChannels, 0)
+			gotBoost := argsContainPair(args, "-af", wantFilter)
+			if gotBoost != tt.wantBoost {
+				t.Fatalf("downmix boost present=%t, want %t; args=%s", gotBoost, tt.wantBoost, strings.Join(args, " "))
+			}
+		})
 	}
 }
 

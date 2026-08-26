@@ -170,6 +170,7 @@ export default function ItemCard({
   libraryId,
   sortField,
   overlayPrefs,
+  narrowPosterActions = false,
   selectionMode = false,
   selected = false,
   onToggleSelect,
@@ -178,6 +179,7 @@ export default function ItemCard({
   libraryId?: number;
   sortField?: string;
   overlayPrefs?: CardOverlayPrefs | null;
+  narrowPosterActions?: boolean;
   selectionMode?: boolean;
   selected?: boolean;
   onToggleSelect?: (item: BrowseItem) => void;
@@ -304,6 +306,7 @@ export default function ItemCard({
           libraryId={libraryId}
           userState={item.user_state}
           variant="poster"
+          narrowPosterActions={narrowPosterActions}
         />
       </div>
       {showCaption ? (
@@ -315,7 +318,7 @@ export default function ItemCard({
             </div>
           ) : null}
           {showMetadata ? (
-            <div className="text-muted-foreground mt-1 text-[11px] font-medium tracking-[0.14em] uppercase">
+            <div className="text-muted-foreground mt-1 truncate text-[11px] font-medium tracking-[0.14em] uppercase">
               <SortMeta item={item} sortField={sortField} />
             </div>
           ) : null}

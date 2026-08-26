@@ -55,7 +55,7 @@ describe("ActionBar", () => {
         "hover:bg-primary",
         "motion-safe:hover:scale-[1.02]",
         "motion-safe:active:scale-[0.98]",
-        "motion-reduce:transition-none",
+        "motion-reduce:hover:bg-primary/90",
       );
     },
   );
@@ -72,13 +72,23 @@ describe("ActionBar", () => {
       "transform-gpu",
       "transition-transform",
       "duration-150",
-      "hover:bg-[color-mix(in_srgb,var(--surface)_40%,transparent)]",
+      "glass-hover",
+      "glass-hover-surface",
       "motion-safe:hover:scale-[1.02]",
       "motion-safe:active:scale-[0.98]",
-      "motion-reduce:transition-none",
     );
-    expect(screen.getByTitle("Favorite")).toHaveClass("cursor-pointer");
-    expect(screen.getByTitle("More")).toHaveClass("cursor-pointer");
+    expect(screen.getByTitle("Favorite")).toHaveClass(
+      "cursor-pointer",
+      "glass-hover",
+      "glass-hover-surface",
+      "transition-none",
+    );
+    expect(screen.getByTitle("More")).toHaveClass(
+      "cursor-pointer",
+      "glass-hover",
+      "glass-hover-surface",
+      "transition-none",
+    );
   });
 
   it("does not expose an enabled pointer affordance while the watched action is pending", () => {
