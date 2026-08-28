@@ -10,6 +10,8 @@ import MediaItemMenu from "@/components/MediaItemMenu";
 import type { EpisodeNavigationState } from "../itemDetailLayout";
 import { useCarouselEmbla } from "@/hooks/useCarouselEmbla";
 import { usePrefetchCatalogItemDetail } from "@/hooks/queries/catalogRead";
+import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
+import type { CardQuickActionMode } from "@/lib/cardQuickActions";
 
 interface EpisodeCarouselProps {
   episodes: EpisodeListItem[];
@@ -26,6 +28,7 @@ export default function EpisodeCarousel({
     (episode) => episode.episode_number === currentEpisodeNumber,
   );
   const prefetchEpisodeDetail = usePrefetchCatalogItemDetail();
+  const { quickActionMode } = useOverlayPrefs();
   const { emblaApi, emblaRef, canScrollPrev, canScrollNext, scrollPrev, scrollNext } =
     useCarouselEmbla({
       options: {
@@ -61,6 +64,7 @@ export default function EpisodeCarousel({
                 ep={ep}
                 isCurrent={ep.episode_number === currentEpisodeNumber}
                 episodeLinkState={episodeLinkState}
+                quickActionMode={quickActionMode}
                 onPrefetch={() => prefetchEpisodeDetail(ep.content_id)}
               />
             ))}
@@ -86,11 +90,13 @@ function EpisodeCarouselCard({
   ep,
   isCurrent,
   episodeLinkState,
+  quickActionMode,
   onPrefetch,
 }: {
   ep: EpisodeListItem;
   isCurrent: boolean;
   episodeLinkState?: EpisodeNavigationState;
+  quickActionMode: CardQuickActionMode;
   onPrefetch: () => void;
 }) {
   const cardRef = useRef<HTMLDivElement>(null);
@@ -177,6 +183,7 @@ function EpisodeCarouselCard({
             showCollectionActions={false}
             showWatchedShortcut
             hasPartialProgress={progress != null}
+            quickActionMode={quickActionMode}
             longPressRef={cardRef}
             itemTitle={episodeTitle}
           />

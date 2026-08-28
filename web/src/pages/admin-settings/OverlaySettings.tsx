@@ -28,16 +28,17 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { CARD_QUICK_ACTION_OPTIONS, normalizeCardQuickActionMode } from "@/lib/cardQuickActions";
+import { OVERLAY_CONFIG_SERVER_KEYS } from "@/hooks/queries/admin/settings";
 
-const KEYS = ["overlays.enabled", "defaults.card_overlays"];
+const KEYS = [...OVERLAY_CONFIG_SERVER_KEYS];
 
 interface DefaultsEditorProps {
   value: string;
   onChange: (value: string) => void;
-  overlaysEnabled: boolean;
 }
 
-function DefaultsEditor({ value, onChange, overlaysEnabled }: DefaultsEditorProps) {
+function DefaultsEditor({ value, onChange }: DefaultsEditorProps) {
   const prefs = parseOverlayPrefs(value || null);
 
   const updateItem = (id: OverlayId, patch: Partial<CardOverlayPrefs["items"][OverlayId]>) => {
@@ -55,13 +56,9 @@ function DefaultsEditor({ value, onChange, overlaysEnabled }: DefaultsEditorProp
   return (
     <div className="space-y-6">
       <div className="grid gap-4 sm:grid-cols-2">
-        <div className={`space-y-2 ${overlaysEnabled ? "" : "opacity-50"}`}>
+        <div className="space-y-2">
           <Label className="text-sm font-medium">Default style preset</Label>
-          <Select
-            value={prefs.preset}
-            disabled={!overlaysEnabled}
-            onValueChange={(v) => setPreset(v as PresetId)}
-          >
+          <Select value={prefs.preset} onValueChange={(v) => setPreset(v as PresetId)}>
             <SelectTrigger className="w-full">
               <SelectValue />
             </SelectTrigger>
@@ -75,7 +72,7 @@ function DefaultsEditor({ value, onChange, overlaysEnabled }: DefaultsEditorProp
           </Select>
         </div>
       </div>
-      <div className={overlaysEnabled ? "" : "pointer-events-none opacity-50"}>
+      <div>
         {OVERLAY_CATEGORIES.map((category) => {
           const overlays = OVERLAY_REGISTRY.filter((d) => d.category === category);
           if (overlays.length === 0) return null;
@@ -99,7 +96,7 @@ function DefaultsEditor({ value, onChange, overlaysEnabled }: DefaultsEditorProp
                       <div className="flex items-center gap-2">
                         <Select
                           value={config.position}
-                          disabled={!overlaysEnabled || !config.enabled}
+                          disabled={!config.enabled}
                           onValueChange={(pos) =>
                             updateItem(def.id, { position: pos as OverlayPosition })
                           }
@@ -117,7 +114,6 @@ function DefaultsEditor({ value, onChange, overlaysEnabled }: DefaultsEditorProp
                         </Select>
                         <Switch
                           checked={config.enabled}
-                          disabled={!overlaysEnabled}
                           onCheckedChange={(checked) => updateItem(def.id, { enabled: checked })}
                         />
                       </div>
@@ -139,6 +135,9 @@ export default function OverlaySettings() {
   if (form.isLoading) return <div>Loading...</div>;
 
   const overlaysEnabled = form.getValue("overlays.enabled") !== "false";
+  const quickActionMode = normalizeCardQuickActionMode(
+    form.getValue("defaults.card_quick_actions"),
+  );
   const defaultsValue = form.getValue("defaults.card_overlays");
   const previewPrefs = parseOverlayPrefs(
     defaultsValue || serializeOverlayPrefs(buildDefaultPrefs()),
@@ -148,16 +147,32 @@ export default function OverlaySettings() {
       <div className="mb-6 space-y-2">
         <h2 className="text-xl font-semibold tracking-tight">Card Overlays</h2>
         <p className="text-muted-foreground text-sm leading-relaxed">
-          Configure the default overlay badges and style preset shown on poster cards. Users can
-          override these in their personal settings.
+          Configure card quick actions, default overlay badges, and the style preset shown on poster
+          cards. These are the defaults for profiles that have not chosen; each profile can turn
+          quick actions and overlay badges on or off for itself.
         </p>
       </div>
 
       <div className="flex-1 space-y-6">
         <FieldGroup label="General">
           <SettingField
-            label="Card Overlays Enabled"
-            hint="When disabled, no overlay badges appear for any user regardless of their personal settings."
+            label="Card Quick Actions Default"
+            hint="Default for profiles that have not chosen; each profile can turn quick actions on or off for themselves."
+            type="toggle"
+            value={form.getValue("defaults.card_quick_actions_enabled") || "false"}
+            onChange={(v) => form.setValue("defaults.card_quick_actions_enabled", v)}
+          />
+          <SettingField
+            label="Card quick actions"
+            hint="The mode applied to profiles that have not chosen their own."
+            type="select"
+            options={[...CARD_QUICK_ACTION_OPTIONS]}
+            value={quickActionMode}
+            onChange={(v) => form.setValue("defaults.card_quick_actions", v)}
+          />
+          <SettingField
+            label="Card Overlays Default"
+            hint="Default for profiles that have not chosen; each profile can turn overlays on or off for themselves."
             type="toggle"
             value={form.getValue("overlays.enabled") || "true"}
             onChange={(v) => form.setValue("overlays.enabled", v)}
@@ -173,7 +188,6 @@ export default function OverlaySettings() {
               <DefaultsEditor
                 value={defaultsValue || serializeOverlayPrefs(buildDefaultPrefs())}
                 onChange={(v) => form.setValue("defaults.card_overlays", v)}
-                overlaysEnabled={overlaysEnabled}
               />
             </div>
             <div className="flex items-start justify-center lg:w-[180px]">

@@ -11,6 +11,8 @@ const mocks = vi.hoisted(() => ({
 }));
 
 const values: Record<string, string> = {
+  "defaults.card_quick_actions_enabled": "true",
+  "defaults.card_quick_actions": "both",
   "overlays.enabled": "true",
   "defaults.card_overlays": "",
 };
@@ -97,19 +99,34 @@ function renderPage() {
 describe("OverlaySettings", () => {
   beforeEach(() => {
     values["overlays.enabled"] = "true";
+    values["defaults.card_quick_actions_enabled"] = "true";
+    values["defaults.card_quick_actions"] = "both";
     mocks.setValue.mockReset();
     mocks.useSettingsForm.mockReset();
     mocks.useSettingsForm.mockReturnValue(makeForm());
   });
 
-  it("registers only the card overlay settings", () => {
+  it("registers card quick-action defaults above the overlay controls", () => {
     const markup = renderPage();
 
     expect(mocks.useSettingsForm).toHaveBeenCalledWith({
-      keys: ["overlays.enabled", "defaults.card_overlays"],
+      keys: [
+        "defaults.card_quick_actions_enabled",
+        "defaults.card_quick_actions",
+        "overlays.enabled",
+        "defaults.card_overlays",
+      ],
     });
+    expect(markup).toContain("Card Quick Actions Default");
+    expect(markup).toContain(
+      "Default for profiles that have not chosen; each profile can turn quick actions on or off for themselves.",
+    );
+    expect(markup).toContain("Favorites only");
+    expect(markup).toContain("Watch indicator only");
+    expect(markup.indexOf("Card quick actions")).toBeLessThan(
+      markup.indexOf("Card Overlays Default"),
+    );
     expect(markup).toContain("Default style preset");
-    expect(markup).not.toContain("Watched indicator");
   });
 
   it("keeps the preset selector at its previous responsive column width", () => {
@@ -134,21 +151,45 @@ describe("OverlaySettings", () => {
     expect(markup).not.toContain("data-overlay-id");
   });
 
-  it("prevents disabled overlay controls from changing defaults", () => {
+  it("keeps the overlay defaults editable when the overlay default toggle is off", () => {
+    // The defaults still apply to every profile that turns overlays on for
+    // itself, so the server-wide default must not lock the editor.
     values["overlays.enabled"] = "false";
     render(<OverlaySettings />);
 
     const selectControls = screen.getAllByTestId("select-control");
     const overlaySwitches = screen.getAllByTestId("overlay-switch");
-    const defaultOverlaySwitches = overlaySwitches.slice(1);
+    const defaultOverlaySwitches = overlaySwitches.slice(2);
+    const presetSelect = selectControls[1];
 
-    expect(selectControls.every((control) => control.hasAttribute("disabled"))).toBe(true);
-    expect(overlaySwitches[0]).not.toHaveAttribute("disabled");
-    expect(defaultOverlaySwitches.every((control) => control.hasAttribute("disabled"))).toBe(true);
+    expect(presetSelect).toBeDefined();
+    expect(presetSelect).not.toHaveAttribute("disabled");
+    expect(defaultOverlaySwitches.length).toBeGreaterThan(0);
+    expect(defaultOverlaySwitches.some((control) => control.hasAttribute("disabled"))).toBe(false);
 
-    selectControls.forEach((control) => fireEvent.click(control));
-    defaultOverlaySwitches.forEach((control) => fireEvent.click(control));
+    fireEvent.click(presetSelect!);
+    expect(mocks.setValue).toHaveBeenCalledWith("defaults.card_overlays", expect.any(String));
 
-    expect(mocks.setValue).not.toHaveBeenCalled();
+    mocks.setValue.mockReset();
+    fireEvent.click(defaultOverlaySwitches[0]!);
+    expect(mocks.setValue).toHaveBeenCalledWith("defaults.card_overlays", expect.any(String));
+  });
+
+  it("defaults the quick-action toggle to off when the setting is unset", () => {
+    values["defaults.card_quick_actions_enabled"] = "";
+    render(<OverlaySettings />);
+
+    // The switch mock reports the value it would write, which is the negation
+    // of the checked state it rendered with.
+    fireEvent.click(screen.getAllByTestId("overlay-switch")[0]!);
+
+    expect(mocks.setValue).toHaveBeenCalledWith("defaults.card_quick_actions_enabled", "true");
+  });
+
+  it("keeps the quick-action mode selectable when the default toggle is off", () => {
+    values["defaults.card_quick_actions_enabled"] = "false";
+    render(<OverlaySettings />);
+
+    expect(screen.getAllByTestId("select-control")[0]).not.toHaveAttribute("disabled");
   });
 });

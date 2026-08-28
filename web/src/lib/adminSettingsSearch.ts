@@ -101,10 +101,20 @@ export const ADMIN_SETTINGS_GROUPS: AdminSettingsSearchGroup[] = [
       {
         id: "overlays",
         label: "Card Overlays",
-        description: "Server-wide poster badge and overlay defaults.",
-        keywords: ["poster", "badges", "defaults.card_overlays", "overlay preset"],
+        description: "Server-wide card quick-action and poster badge defaults.",
+        keywords: [
+          "poster",
+          "badges",
+          "quick actions",
+          "favorites",
+          "watch indicator",
+          "defaults.card_overlays",
+          "overlay preset",
+        ],
         settings: settingIndex(
-          "Card Overlays Enabled",
+          "Card Quick Actions Default",
+          "Card quick actions",
+          "Card Overlays Default",
           "Default Configuration",
           "Default style preset",
           "Overlay position",

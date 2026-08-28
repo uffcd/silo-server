@@ -8,6 +8,7 @@ import MediaItemMenu from "@/components/MediaItemMenu";
 import CardOverlays from "@/components/overlays/CardOverlays";
 import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
 import { usePrefetchCatalogItemDetail } from "@/hooks/queries/catalogRead";
+import type { CardQuickActionMode } from "@/lib/cardQuickActions";
 import { overlayDataFromEpisodeListItem, type CardOverlayPrefs } from "@/lib/overlays";
 import { EpisodeGridSkeleton } from "./SectionSkeletons";
 import type { EpisodeNavigationState } from "../itemDetailLayout";
@@ -23,7 +24,7 @@ export default function SeasonEpisodeGrid({
   isLoading,
   episodeLinkState,
 }: SeasonEpisodeGridProps) {
-  const { prefs: overlayPrefs } = useOverlayPrefs();
+  const { prefs: overlayPrefs, quickActionMode } = useOverlayPrefs();
   const prefetchEpisodeDetail = usePrefetchCatalogItemDetail();
 
   if (isLoading) {
@@ -46,6 +47,7 @@ export default function SeasonEpisodeGrid({
           episode={episode}
           episodeLinkState={episodeLinkState}
           overlayPrefs={overlayPrefs}
+          quickActionMode={quickActionMode}
           onPrefetch={() => prefetchEpisodeDetail(episode.content_id)}
         />
       ))}
@@ -57,11 +59,13 @@ function SeasonEpisodeCard({
   episode,
   episodeLinkState,
   overlayPrefs,
+  quickActionMode,
   onPrefetch,
 }: {
   episode: EpisodeListItem;
   episodeLinkState?: EpisodeNavigationState;
   overlayPrefs: CardOverlayPrefs | null;
+  quickActionMode: CardQuickActionMode;
   onPrefetch: () => void;
 }) {
   const cardRef = useRef<HTMLDivElement>(null);
@@ -130,6 +134,7 @@ function SeasonEpisodeCard({
           showCollectionActions={false}
           showWatchedShortcut
           hasPartialProgress={hasPartialProgress}
+          quickActionMode={quickActionMode}
           longPressRef={cardRef}
           itemTitle={episodeTitle}
         />
