@@ -9,18 +9,19 @@ import { SecretField } from "@/components/settings/SecretField";
 import { SettingsPageHeader } from "@/components/settings/SettingsPageHeader";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useBranding } from "@/hooks/useBranding";
-import { useCheckAdminSettingsConnection } from "@/hooks/queries/admin/settings";
+import {
+  useCatalogSearchStatus,
+  useCheckAdminSettingsConnection,
+} from "@/hooks/queries/admin/settings";
 import { useRestartKeys } from "@/hooks/useRestartKeys";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
 import { FieldGroup } from "./FieldGroup";
 import { MarkerTasksCard } from "./MarkerTasksCard";
 import { SaveBar } from "./SaveBar";
 import { SearchStatusPanel } from "./SearchStatusPanel";
-import { SettingField } from "./SettingField";
+import { SettingField, SettingFieldStatus } from "./SettingField";
 
-const CACHE_IMAGES_KEY = "metadata.cache_images";
-
-const METADATA_KEYS = [CACHE_IMAGES_KEY];
+const ARTWORK_KEYS = ["metadata.cache_images"];
 
 const SCANNER_KEYS = ["scanner.workers", "matcher.workers", "matcher.batch_size"];
 
@@ -46,7 +47,7 @@ const SEARCH_KEYS = ["catalog.search.provider", ...MEILI_KEYS];
 // without a control here because the defaults are right for every deployment we
 // support — catalog.search.meilisearch.{rebuild_batch_size,
 // rebuild_task_queue_depth,index_types,embedder,binary_quantized}.
-const KEYS = [...METADATA_KEYS, ...SCANNER_KEYS, ...MARKER_KEYS, ...SEARCH_KEYS];
+const KEYS = [...ARTWORK_KEYS, ...SCANNER_KEYS, ...MARKER_KEYS, ...SEARCH_KEYS];
 
 export default function LibraryMetadataSettings() {
   const form = useSettingsForm({ keys: useMemo(() => KEYS, []) });
@@ -55,27 +56,32 @@ export default function LibraryMetadataSettings() {
   const checkConnection = useCheckAdminSettingsConnection();
   const [connectionResult, setConnectionResult] = useState<ConnectionCheckResponse | null>(null);
 
-  // Image caching writes provider artwork into the public bucket, so the server
-  // rejects enabling it when no bucket is configured at all. `storage_available`
-  // is the process-level truth (branding uses the same flag for asset uploads);
-  // s3.public_bucket only says the setting was saved, which is enough for the
-  // server to accept the save and separates "restart pending" from "never
-  // configured". s3.public_bucket is not staged here, but getValue falls back
-  // to the full settings response.
+  // Artwork storage writes provider images into the public bucket, so the
+  // server rejects enabling it when no bucket is configured at all.
+  // `storage_available` is the process-level truth (branding uses the same
+  // flag for asset uploads); s3.public_bucket only says a bucket was saved,
+  // which is enough for the server to accept the save — the two together
+  // separate "restart pending" from "never configured". s3.public_bucket is
+  // not staged here, but getValue falls back to the full settings response.
   const publicBucketSaved = Boolean(form.getValue("s3.public_bucket"));
-  const imageStorageAvailable = branding.storageAvailable;
-  const cacheImagesOn = form.getValue(CACHE_IMAGES_KEY) === "true";
+  const artworkStorageOn = form.getValue("metadata.cache_images") === "true";
   // Never trap an admin with it on: turning it off stays available even when
   // the bucket went away.
-  const cacheImagesLocked = !imageStorageAvailable && !publicBucketSaved && !cacheImagesOn;
+  const artworkStorageLocked =
+    !branding.storageAvailable && !publicBucketSaved && !artworkStorageOn;
 
   const provider = form.getValue("catalog.search.provider") || "postgres";
   const meiliEnabled = provider === "meilisearch";
+  const { data: searchStatus } = useCatalogSearchStatus(meiliEnabled);
   const anyDirty = (keys: string[]) => keys.some((key) => form.isDirty(key));
   const allRestart = (keys: string[]) => keys.every((key) => restartKeys.has(key));
   // Staged Meilisearch edits stay reachable after switching the provider back,
   // so the save bar can never count a change the admin cannot see.
   const showMeili = meiliEnabled || anyDirty(MEILI_KEYS);
+  const enablingSemanticSearch =
+    form.isDirty("catalog.search.meilisearch.semantic_enabled") &&
+    form.getPersistedValue("catalog.search.meilisearch.semantic_enabled") !== "true" &&
+    form.getValue("catalog.search.meilisearch.semantic_enabled") === "true";
 
   async function handleCheckConnection() {
     try {
@@ -112,21 +118,25 @@ export default function LibraryMetadataSettings() {
       <SettingsPageHeader title="Library & Metadata" className="mb-8" />
 
       <div className="flex-1 space-y-5">
-        <FieldGroup label="Metadata" restartAll={allRestart(METADATA_KEYS)}>
-          {!imageStorageAvailable && (
+        <FieldGroup
+          label="Artwork"
+          description="Posters and backdrops from metadata providers, copied into the public bucket and served from there."
+          restartAll={allRestart(ARTWORK_KEYS)}
+        >
+          {!branding.storageAvailable && (
             <div className="mt-3 flex items-start gap-3 rounded-xl border border-amber-500/20 bg-amber-500/5 p-3">
               <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
               <p className="text-muted-foreground text-[13px] leading-relaxed">
                 {publicBucketSaved ? (
-                  <>Restart the server for image caching to start.</>
+                  <>Restart the server for artwork storage to start.</>
                 ) : (
                   <>
-                    Image caching needs a public S3 bucket, set in{" "}
+                    Artwork storage needs a public S3 bucket, set in{" "}
                     <Link
                       to="/admin/settings/infrastructure"
                       className="text-foreground font-medium underline-offset-2 hover:underline"
                     >
-                      Infrastructure
+                      Storage &amp; Database
                     </Link>{" "}
                     settings.
                   </>
@@ -135,13 +145,13 @@ export default function LibraryMetadataSettings() {
             </div>
           )}
           <SettingField
-            label="S3 image caching"
+            label="Store artwork in your bucket"
             type="toggle"
-            description="Serves provider artwork from your S3 bucket."
-            value={form.getValue(CACHE_IMAGES_KEY)}
-            onChange={(value) => form.setValue(CACHE_IMAGES_KEY, value)}
-            disabled={cacheImagesLocked}
-            restartRequired={restartKeys.has(CACHE_IMAGES_KEY)}
+            description="When off, clients load artwork straight from the providers."
+            value={form.getValue("metadata.cache_images")}
+            onChange={(value) => form.setValue("metadata.cache_images", value)}
+            disabled={artworkStorageLocked}
+            restartRequired={restartKeys.has("metadata.cache_images")}
           />
         </FieldGroup>
 
@@ -328,6 +338,15 @@ export default function LibraryMetadataSettings() {
                     form.setValue("catalog.search.meilisearch.semantic_enabled", value)
                   }
                   description="Also matches items whose description means something similar."
+                  status={
+                    enablingSemanticSearch ? (
+                      <SettingFieldStatus tone="warn">
+                        Enabling this changes the index format. After you save and restart, Silo
+                        rebuilds the index automatically. Keyword search stays available while it
+                        rebuilds.
+                      </SettingFieldStatus>
+                    ) : undefined
+                  }
                   disabled={!meiliEnabled}
                   restartRequired={restartKeys.has("catalog.search.meilisearch.semantic_enabled")}
                 />
@@ -344,6 +363,30 @@ export default function LibraryMetadataSettings() {
                 />
               </AdvancedSection>
             </>
+          )}
+
+          {meiliEnabled && searchStatus?.degraded && (
+            <div className="py-3.5">
+              <SettingFieldStatus tone="warn">
+                <span>
+                  {searchStatus.degraded_reason ?? "Search is running in a degraded mode."}
+                  {searchStatus.index.rebuild_required && (
+                    <>
+                      {" "}
+                      Automatic search maintenance rebuilds the index in the background and retries
+                      if needed.{" "}
+                      <Link
+                        className="font-medium underline underline-offset-2"
+                        to="/admin/tasks/sync_catalog_search_index"
+                      >
+                        Open maintenance task
+                      </Link>
+                      .
+                    </>
+                  )}
+                </span>
+              </SettingFieldStatus>
+            </div>
           )}
 
           <AdvancedSection id="library.search.status" title="Search status">
