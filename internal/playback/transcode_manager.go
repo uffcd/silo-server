@@ -22,10 +22,11 @@ import (
 // internal/playback does not import internal/config (avoiding an import cycle);
 // each embedding handler adapts its own config snapshot into this shape.
 type TranscodeRuntimeConfig struct {
-	TranscodeDir string
-	FFmpegPath   string
-	HWAccel      string
-	HWDevice     string
+	TranscodeDir            string
+	FFmpegPath              string
+	HWAccel                 string
+	HWDevice                string
+	SegmentRetentionSeconds int
 }
 
 // sessionReconstructor is the SessionManager capability used to re-register a
@@ -279,6 +280,26 @@ func (m *TranscodeManager) RestartSessionLocked(ctx context.Context, sessionID s
 	return m.restartSessionLocked(sessionID, ts, func() error {
 		return ts.Restart(ctx, seekSeconds, startSegment)
 	})
+}
+
+// RestartSegmentLocked resolves and restarts one missing HLS segment under the
+// per-session lifecycle lock. Copy-video resolution reads the current manifest,
+// so keeping resolution and restart inside the same lock preserves the mapping
+// it observed.
+func (m *TranscodeManager) RestartSegmentLocked(
+	ctx context.Context,
+	sessionID string,
+	ts *TranscodeSession,
+	segNum int,
+) (SegmentRecoveryTarget, bool, error) {
+	var target SegmentRecoveryTarget
+	var ok bool
+	err := m.restartSessionLocked(sessionID, ts, func() error {
+		var restartErr error
+		target, ok, restartErr = ts.RestartSegment(ctx, segNum)
+		return restartErr
+	})
+	return target, ok, err
 }
 
 func (m *TranscodeManager) restartSessionLocked(sessionID string, ts *TranscodeSession, restart func() error) error {
@@ -583,6 +604,11 @@ func (m *TranscodeManager) reconstructSession(ctx context.Context, sessionID str
 		// a forged or stale request.
 		return nil, nil, false
 	}
+	if err := ValidateCopyFMP4RecipeCard(card); err != nil {
+		slog.WarnContext(ctx, "transcode reconstruct copy recipe rejected", "component", "playback",
+			"session", sessionID, "playback_session_id", sessionID, "error", err)
+		return nil, nil, false
+	}
 	// Re-bind ownership to the card owner. A zero caller is allowed (the authless
 	// transcode delivery routes — HLS master.m3u8 / segment — treat the session
 	// UUID as the bearer credential when auth is optional); a non-zero caller that
@@ -598,7 +624,7 @@ func (m *TranscodeManager) reconstructSession(ctx context.Context, sessionID str
 	// An empty PlayMethod is a card written before direct/remux were
 	// reconstructable; treat it as a transcode (the only kind then persisted).
 	method := card.PlayMethod
-	if method == "" {
+	if method == "" || method == playMethodCopyFMP4V1 {
 		method = PlayTranscode
 	}
 
@@ -616,6 +642,10 @@ func (m *TranscodeManager) reconstructSession(ctx context.Context, sessionID str
 		BasePlayMethod:         method,
 		TranscodeNodeURL:       card.TranscodeNodeURL,
 		TranscodeTransportID:   card.TranscodeTransportID,
+		RoutingWorkload:        card.RoutingWorkload,
+		RoutingExecution:       card.RoutingExecution,
+		RoutingEgress:          card.RoutingEgress,
+		RoutingEgressNodeID:    card.RoutingEgressNodeID,
 		AudioTrackIndex:        card.AudioTrackIndex,
 		TranscodeAudio:         card.TranscodeAudio,
 		RemuxDVMode:            card.RemuxDVMode,
@@ -780,8 +810,11 @@ func (m *TranscodeManager) doReconstructTranscode(ctx context.Context, sessionID
 	// direct/remux card ID cannot accidentally spawn an encode. An empty
 	// PlayMethod is back-compat for a token minted before the discriminator
 	// (transcode).
-	if card.PlayMethod != "" && card.PlayMethod != PlayTranscode {
+	if !card.IsTranscodeRecipe() {
 		return nil, nil
+	}
+	if err := ValidateCopyFMP4RecipeCard(card); err != nil {
+		return nil, err
 	}
 
 	// Mark in-flight for the whole rebuild so a concurrent cleanup never reaps the
@@ -800,6 +833,7 @@ func (m *TranscodeManager) doReconstructTranscode(ctx context.Context, sessionID
 	// operator config change applies to reconstructed sessions too.
 	opts.HWAccel = cfg.HWAccel
 	opts.HWDevice = cfg.HWDevice
+	opts.SegmentRetentionSeconds = cfg.SegmentRetentionSeconds
 
 	// Serialize before taking a global pacing slot. A reconstruct stalled behind
 	// another start for this session must not consume capacity needed by unrelated

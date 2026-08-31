@@ -70,6 +70,7 @@ const (
 	ClaimClientManagedDynamicRangeV3 = "client_managed_dynamic_range_v1"
 	ClaimClientSelectedAudioTrackV3  = "client_selected_audio_track_v1"
 	ClientDV8HDR10PlusSanitizerV3    = "client_dv8_hdr10plus_sanitizer_v1"
+	ClientNativeHLSPlaybackV3        = "native_hls_playback_v1"
 	ClientPostResumeRecoveryV3       = "client_post_resume_video_recovery_v1"
 	ClientSurfaceRecoveryV3          = "client_surface_recovery_v1"
 	DeviceQuirkRegistryRevisionV3    = "2026-07-13.1"
@@ -186,7 +187,7 @@ const (
 	TransformationHDRToSDRToneMapV3 = "hdr_to_sdr_tonemap"
 
 	TransformationVideoToH264RecipeVersionV3     = "2"
-	TransformationAudioToAACRecipeVersionV3      = "3"
+	TransformationAudioToAACRecipeVersionV3      = "4"
 	TransformationHDRToSDRToneMapRecipeVersionV3 = "1"
 )
 
@@ -623,15 +624,16 @@ type TimelineV3 struct {
 }
 
 type EffectiveRecipeV3 struct {
-	VideoCodec    string   `json:"video_codec,omitempty"`
-	AudioCodec    string   `json:"audio_codec,omitempty"`
-	Width         *int     `json:"width,omitempty"`
-	Height        *int     `json:"height,omitempty"`
-	FrameRate     *float64 `json:"frame_rate,omitempty"`
-	BitrateKbps   *int     `json:"bitrate_kbps,omitempty"`
-	DynamicRange  string   `json:"dynamic_range,omitempty"`
-	AudioChannels *int     `json:"audio_channels,omitempty"`
-	AudioLayout   string   `json:"audio_layout,omitempty"`
+	VideoCodec       string   `json:"video_codec,omitempty"`
+	VideoSampleEntry string   `json:"video_sample_entry,omitempty"`
+	AudioCodec       string   `json:"audio_codec,omitempty"`
+	Width            *int     `json:"width,omitempty"`
+	Height           *int     `json:"height,omitempty"`
+	FrameRate        *float64 `json:"frame_rate,omitempty"`
+	BitrateKbps      *int     `json:"bitrate_kbps,omitempty"`
+	DynamicRange     string   `json:"dynamic_range,omitempty"`
+	AudioChannels    *int     `json:"audio_channels,omitempty"`
+	AudioLayout      string   `json:"audio_layout,omitempty"`
 }
 
 type SourceDescriptorV3 struct {

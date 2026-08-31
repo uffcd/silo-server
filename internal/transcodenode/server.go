@@ -23,6 +23,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/chapterthumbs"
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/downloadprepare"
+	"github.com/Silo-Server/silo-server/internal/httpstream"
 	"github.com/Silo-Server/silo-server/internal/nodeconfig"
 	"github.com/Silo-Server/silo-server/internal/nodemetrics"
 	"github.com/Silo-Server/silo-server/internal/nodesessions"
@@ -30,6 +31,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/streamtelemetry"
 	"github.com/Silo-Server/silo-server/internal/streamtoken"
 	"github.com/Silo-Server/silo-server/internal/tonemap"
+	"github.com/Silo-Server/silo-server/internal/transcodeproxy"
 )
 
 // TranscodeStartRequest is the JSON body for POST /transcode/start.
@@ -41,6 +43,7 @@ type TranscodeStartRequest struct {
 	SourceVideoBitDepth        int                    `json:"source_video_bit_depth,omitempty"`
 	SourceAudioChannels        int                    `json:"source_audio_channels,omitempty"`
 	AudioRecipeVersion         string                 `json:"audio_recipe_version,omitempty"`
+	CopyFMP4RecipeVersion      string                 `json:"copy_fmp4_recipe_version,omitempty"`
 	SoftwareVideoDecode        bool                   `json:"software_video_decode,omitempty"`
 	ToneMapPolicy              tonemap.Policy         `json:"tone_map_policy,omitempty"`
 	ToneMapMode                tonemap.Mode           `json:"tone_map_mode,omitempty"`
@@ -54,6 +57,7 @@ type TranscodeStartRequest struct {
 	ToneMapDVRPUPresent        bool                   `json:"tone_map_dv_rpu_present,omitempty"`
 	VideoBitstreamFilter       string                 `json:"video_bitstream_filter,omitempty"`
 	VideoSampleEntry           string                 `json:"video_sample_entry,omitempty"`
+	CopyVideoMPEGTS            bool                   `json:"copy_video_mpegts,omitempty"`
 	SeekSeconds                float64                `json:"seek_seconds"`
 	StreamOriginSeconds        float64                `json:"stream_origin_seconds,omitempty"`
 	CopySeekAnchorResolved     bool                   `json:"copy_seek_anchor_resolved,omitempty"`
@@ -84,9 +88,13 @@ type TranscodeStartResponse struct {
 	// understood. An old node omits it, allowing current callers to stop the job
 	// before publishing bytes from a silently ignored SourceAudioChannels field.
 	AudioRecipeVersion string `json:"audio_recipe_version,omitempty"`
+	// CopyFMP4RecipeVersion attests the copy-video HLS timestamp and bitstream
+	// recipe. Old nodes omit it and are rejected before their bytes are exposed.
+	CopyFMP4RecipeVersion string `json:"copy_fmp4_recipe_version,omitempty"`
 }
 
 var ErrAudioRecipeAttestationMismatch = errors.New("transcode node audio recipe attestation mismatch")
+var ErrCopyFMP4RecipeAttestationMismatch = errors.New("transcode node copy-fmp4 recipe attestation mismatch")
 
 func validateAudioRecipeRequest(req TranscodeStartRequest) error {
 	if req.SourceAudioChannels == 0 && req.AudioRecipeVersion == "" {
@@ -110,6 +118,32 @@ func ValidateAudioRecipeAttestation(req TranscodeStartRequest, response Transcod
 	}
 	if req.AudioRecipeVersion != "" && response.AudioRecipeVersion != req.AudioRecipeVersion {
 		return fmt.Errorf("%w: got %q, want %q", ErrAudioRecipeAttestationMismatch, response.AudioRecipeVersion, req.AudioRecipeVersion)
+	}
+	return nil
+}
+
+func validateCopyFMP4RecipeRequest(req TranscodeStartRequest) error {
+	isCopy := strings.EqualFold(strings.TrimSpace(req.TargetCodecVideo), "copy")
+	if !isCopy && req.CopyFMP4RecipeVersion == "" {
+		return nil
+	}
+	if !isCopy || req.CopyFMP4RecipeVersion != playback.CopyFMP4RecipeVersion {
+		return fmt.Errorf("%w: target_codec=%q recipe_version=%q",
+			ErrCopyFMP4RecipeAttestationMismatch, req.TargetCodecVideo, req.CopyFMP4RecipeVersion)
+	}
+	return nil
+}
+
+// ValidateCopyFMP4RecipeAttestation requires current copy-video starts to be
+// acknowledged by the executor. Encoded starts remain compatible with older
+// nodes and their empty responses.
+func ValidateCopyFMP4RecipeAttestation(req TranscodeStartRequest, response TranscodeStartResponse) error {
+	if err := validateCopyFMP4RecipeRequest(req); err != nil {
+		return err
+	}
+	if req.CopyFMP4RecipeVersion != "" && response.CopyFMP4RecipeVersion != req.CopyFMP4RecipeVersion {
+		return fmt.Errorf("%w: got %q, want %q",
+			ErrCopyFMP4RecipeAttestationMismatch, response.CopyFMP4RecipeVersion, req.CopyFMP4RecipeVersion)
 	}
 	return nil
 }
@@ -336,6 +370,25 @@ func (s *Server) restartSessionLocked(ctx context.Context, sessionID string, ses
 		return playback.ErrSessionSuperseded
 	}
 	return session.Restart(ctx, seekSeconds, startSegment)
+}
+
+// restartSegmentLocked resolves and applies missing-segment recovery while the
+// node's lifecycle lock keeps the current manifest and live session stable.
+func (s *Server) restartSegmentLocked(
+	ctx context.Context,
+	sessionID string,
+	session *playback.TranscodeSession,
+	segNum int,
+) (playback.SegmentRecoveryTarget, bool, error) {
+	unlock := s.lockSessionLifecycle(sessionID)
+	defer unlock()
+	s.mu.RLock()
+	live, ok := s.sessions[sessionID]
+	s.mu.RUnlock()
+	if !ok || live != session {
+		return playback.SegmentRecoveryTarget{}, false, playback.ErrSessionSuperseded
+	}
+	return session.RestartSegment(ctx, segNum)
 }
 
 // NewServer creates a new transcode server.
@@ -660,6 +713,7 @@ func (s *Server) Handler() http.Handler {
 		r.Delete("/transcode/{session_id}", s.handleStop)
 		r.Get("/transcode/{session_id}/master.m3u8", observeNode(s.telemetry, http.MethodGet, "/transcode/{session_id}/master.m3u8", s.handleManifest))
 		r.Get("/transcode/{session_id}/segment/{name}", observeNode(s.telemetry, http.MethodGet, "/transcode/{session_id}/segment/{name}", s.handleSegment))
+		r.Post("/transcode/{session_id}/segment/{name}/downloaded", s.handleSegmentDownloaded)
 		r.Post("/admin/force-reload", s.handleForceReload)
 		r.Post("/admin/reload-config", s.handleReloadConfig)
 		r.Post("/admin/reprobe-capabilities", s.handleReprobeCapabilities)
@@ -1262,6 +1316,10 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid audio recipe", http.StatusBadRequest)
 		return
 	}
+	if err := validateCopyFMP4RecipeRequest(req); err != nil {
+		http.Error(w, "invalid copy-fmp4 recipe", http.StatusBadRequest)
+		return
+	}
 	if !s.requireApprovedInputPath(w, r, req.InputPath) {
 		return
 	}
@@ -1302,6 +1360,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		ToneMapDVRPUPresent:        req.ToneMapDVRPUPresent,
 		VideoBitstreamFilter:       req.VideoBitstreamFilter,
 		VideoSampleEntry:           req.VideoSampleEntry,
+		CopyVideoMPEGTS:            req.CopyVideoMPEGTS,
 		SeekSeconds:                req.SeekSeconds,
 		StreamOriginSeconds:        req.StreamOriginSeconds,
 		CopySeekAnchorResolved:     req.CopySeekAnchorResolved,
@@ -1313,6 +1372,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		TargetAudioBitrateKbps:     req.TargetAudioBitrateKbps,
 		TargetBitrateKbps:          req.TargetBitrateKbps,
 		SegmentDuration:            req.SegmentDuration,
+		SegmentRetentionSeconds:    cfg.Playback.SegmentRetentionSeconds,
 		FFmpegPath:                 cfg.Playback.FFmpegPath,
 		HWAccel:                    req.HWAccel,
 		// This node's configured device (or device list — StartTranscode
@@ -1448,11 +1508,12 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(TranscodeStartResponse{
-		SessionID:          req.SessionID,
-		Status:             "started",
-		HWAccel:            effectiveHWAccel,
-		ToneMapMode:        session.Opts().ToneMapMode,
-		AudioRecipeVersion: req.AudioRecipeVersion,
+		SessionID:             req.SessionID,
+		Status:                "started",
+		HWAccel:               effectiveHWAccel,
+		ToneMapMode:           session.Opts().ToneMapMode,
+		AudioRecipeVersion:    req.AudioRecipeVersion,
+		CopyFMP4RecipeVersion: req.CopyFMP4RecipeVersion,
 	})
 }
 
@@ -1572,7 +1633,7 @@ func recipeServesTransport(card playback.RecipeCard, transportID string) bool {
 	if card.TranscodeTransportID != "" {
 		expected = card.TranscodeTransportID
 	}
-	return expected == transportID && (card.PlayMethod == "" || card.PlayMethod == playback.PlayTranscode)
+	return expected == transportID && card.IsTranscodeRecipe() && playback.ValidateCopyFMP4RecipeCard(card) == nil
 }
 
 // recipeIsComplete reports whether a recipe carries the encode parameters
@@ -1626,6 +1687,7 @@ func (s *Server) spawnReconstruct(r *http.Request, sessionID string, requestedSe
 	// rebuild. Run as a transcode node, not integrated (card.TranscodeOpts defaults).
 	opts.HWAccel = cfg.Playback.HWAccel
 	opts.HWDevice = cfg.Playback.HWDevice
+	opts.SegmentRetentionSeconds = cfg.Playback.SegmentRetentionSeconds
 	opts.NodeType = "transcode"
 	opts.ExecutionMode = "transcode_node"
 	if toneMapRecipeRequested(opts) {
@@ -1901,7 +1963,7 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 	}
 	s.attachTelemetrySession(r, sessionID)
 
-	segPath, err := session.GetSegment(name)
+	segmentLease, err := session.OpenSegment(name)
 	if err != nil && err == playback.ErrSegmentNotFound {
 		segNum, parseErr := playback.ParseSegmentNumber(name)
 		if parseErr == nil {
@@ -1936,7 +1998,7 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 					"session", sessionID,
 					"playback_session_id", sessionID,
 				)
-				segPath, err = session.WaitForSegment(name, decision.WaitTimeout)
+				segmentLease, err = session.WaitForOpenSegment(name, decision.WaitTimeout)
 				if err != nil && err == playback.ErrSegmentNotFound {
 					slog.InfoContext(r.Context(), "transcode segment wait timeout", "component", "transcodenode",
 						"segment", name,
@@ -1954,12 +2016,19 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if err != nil && err == playback.ErrSegmentNotFound && decision.RestartOnTimeout {
-				seekSeconds, ok, seekErr := session.RestartSeekTarget(segNum)
-				if seekErr != nil && !errors.Is(seekErr, playback.ErrManifestNotReady) {
-					slog.ErrorContext(r.Context(), "resolve transcode node seek target", "component", "transcodenode", "error", seekErr, "segment", name, "session", sessionID, "playback_session_id", sessionID)
+				target, ok, restartErr := s.restartSegmentLocked(
+					r.Context(),
+					sessionID,
+					session,
+					segNum,
+				)
+				if restartErr != nil && !errors.Is(restartErr, playback.ErrManifestNotReady) {
+					slog.ErrorContext(r.Context(), "restart transcode node at missing segment", "component", "transcodenode", "error", restartErr, "segment", name, "session", sessionID, "playback_session_id", sessionID)
 				}
 
-				if ok {
+				if restartErr != nil {
+					err = restartErr
+				} else if ok {
 					slog.InfoContext(r.Context(), "transcode node seek restart", "component", "transcodenode",
 						"segment", name,
 						"requested_segment", segNum,
@@ -1969,31 +2038,23 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 						"last_produced_age_ms", lastProducedAgeMS,
 						"wait_timeout_ms", decision.WaitTimeout.Milliseconds(),
 						"reason", decision.Reason,
-						"seek_seconds", seekSeconds,
+						"seek_seconds", target.SeekSeconds,
+						"stream_origin_seconds", target.StreamOriginSeconds,
+						"resolved_start_segment", target.StartSegmentNumber,
 						"session", sessionID,
 						"playback_session_id", sessionID,
 					)
 
-					if restartErr := s.restartSessionLocked(
-						r.Context(),
-						sessionID,
-						session,
-						seekSeconds,
-						segNum,
-					); restartErr == nil {
-						segPath, err = session.WaitForSegment(name, 30*time.Second)
-					} else {
-						err = restartErr
-					}
+					segmentLease, err = session.WaitForOpenSegment(name, 30*time.Second)
 				}
-				if !ok && session.IsCopyVideo() {
+				if !ok && restartErr == nil && session.IsCopyVideo() {
 					err = playback.ErrSegmentNotFound
 				}
 			}
 		} else if session.IsRunning() {
 			// Non-numbered segment (e.g., init.mp4 for fMP4 HLS).
 			// Wait briefly — the init segment is written almost immediately.
-			segPath, err = session.WaitForSegment(name, 10*time.Second)
+			segmentLease, err = session.WaitForOpenSegment(name, 10*time.Second)
 		}
 	}
 	if err != nil {
@@ -2007,7 +2068,46 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Cache-Control", "no-store, max-age=0")
 	w.Header().Set("Pragma", "no-cache")
-	http.ServeFile(w, r, segPath)
+	proxied := r.Header.Get(transcodeproxy.RequestHeader) == "1"
+	if proxied {
+		w.Header().Set(transcodeproxy.GenerationHeader, segmentLease.GenerationToken)
+	}
+	defer func() { _ = segmentLease.Close() }()
+	sw := httpstream.NewRollingDeadlineWriter(w)
+	http.ServeContent(sw, r, segmentLease.Info.Name(), segmentLease.Info.ModTime(), segmentLease.File)
+	if !proxied && r.Method == http.MethodGet &&
+		sw.CompletedFullResponse(segmentLease.Info.Size()) {
+		if segmentNumber, parseErr := playback.ParseSegmentNumber(name); parseErr == nil {
+			session.ReportSegmentDownloadedForGeneration(segmentNumber, segmentLease.Generation)
+		}
+	}
+}
+
+// handleSegmentDownloaded records completion only after the central API has
+// delivered the full segment to its downstream playback client. The generation
+// returned with the original segment response prevents a delayed acknowledgement
+// from advancing a replacement FFmpeg timeline.
+func (s *Server) handleSegmentDownloaded(w http.ResponseWriter, r *http.Request) {
+	sessionID := chi.URLParam(r, "session_id")
+	name := chi.URLParam(r, "name")
+	segmentNumber, err := playback.ParseSegmentNumber(name)
+	if err != nil {
+		http.Error(w, "invalid segment", http.StatusBadRequest)
+		return
+	}
+	generationToken := r.Header.Get(transcodeproxy.GenerationHeader)
+	if generationToken == "" {
+		http.Error(w, "invalid segment generation", http.StatusBadRequest)
+		return
+	}
+
+	session, ok := s.acquireSessionTouched(sessionID)
+	if !ok {
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+	session.ReportSegmentDownloadedForGenerationToken(segmentNumber, generationToken)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleReloadConfig re-reads this node's configuration and nothing else.

@@ -389,6 +389,24 @@ func TestPlanAttemptKeyV3Fixture(t *testing.T) {
 	}
 }
 
+func TestPlanIdentityIncludesVideoSampleEntry(t *testing.T) {
+	plan := PlanV3{
+		PlanID:          "plan:sample-entry",
+		Delivery:        DeliveryRemuxHLSV3,
+		Stream:          StreamV3{Protocol: StreamHLSV3, Container: "hls"},
+		EffectiveRecipe: EffectiveRecipeV3{VideoCodec: "hevc"},
+	}
+	withoutEntryID := DeterministicPlanIDV3("attempt-sample-entry", 42, 42, plan)
+	withoutEntryKey := PlanAttemptKeyV3(plan, "output-1", nil)
+	plan.EffectiveRecipe.VideoSampleEntry = VideoSampleEntryHVC1
+	if withEntryID := DeterministicPlanIDV3("attempt-sample-entry", 42, 42, plan); withEntryID == withoutEntryID {
+		t.Fatal("sample-entry change did not alter the deterministic plan id")
+	}
+	if withEntryKey := PlanAttemptKeyV3(plan, "output-1", nil); withEntryKey == withoutEntryKey {
+		t.Fatal("sample-entry change did not alter the plan-attempt key")
+	}
+}
+
 func TestProtocolV3ConformanceMatrixCoversReleaseTrain(t *testing.T) {
 	var matrix ConformanceMatrixV3
 	body, err := os.ReadFile("testdata/protocol_v3/conformance_matrix.json")
@@ -984,6 +1002,105 @@ func TestPlanPlaybackV3SafariNativeHLSAvoidsProgressiveDVRemux(t *testing.T) {
 		result.TargetVideoCodec != "copy" || result.PlayMethod != PlayRemux ||
 		!result.Plan.Claims.Video.DolbyVision {
 		t.Fatalf("result = %s", ExplainPlannerResultV3(result))
+	}
+}
+
+func TestHLSVideoSampleEntryV3ScopesNativeRecipes(t *testing.T) {
+	tests := []struct {
+		name         string
+		platform     string
+		appBuild     string
+		deviceQuirks bool
+		nativeHLS    bool
+		dvProfile    int
+		dvStrip      bool
+		want         string
+	}{
+		{name: "legacy Android plain HEVC", platform: "android", appBuild: legacyAndroidMedia3HLSBuildV3, deviceQuirks: true, want: VideoSampleEntryHVC1},
+		{name: "legacy Android Profile 7 strip", platform: "android", appBuild: legacyAndroidMedia3HLSBuildV3, deviceQuirks: true, dvProfile: 7, dvStrip: true, want: VideoSampleEntryHVC1},
+		{name: "legacy Android Profile 8 preserve", platform: "android", appBuild: legacyAndroidMedia3HLSBuildV3, deviceQuirks: true, dvProfile: 8, want: VideoSampleEntryDVH1},
+		{name: "Android quirks without legacy build", platform: "android", deviceQuirks: true, dvProfile: 8, want: ""},
+		{name: "Android quirks on another build", platform: "android", appBuild: "16", deviceQuirks: true, dvProfile: 8, want: ""},
+		{name: "unscoped Android legacy build", platform: "android", appBuild: legacyAndroidMedia3HLSBuildV3, dvProfile: 8, want: ""},
+		{name: "web MediaSource", platform: "web", deviceQuirks: true, dvProfile: 7, dvStrip: true, want: ""},
+		{name: "explicit native HLS Profile 7 strip", platform: "tvos", nativeHLS: true, dvProfile: 7, dvStrip: true, want: VideoSampleEntryHVC1},
+		{name: "explicit native HLS Profile 8 preserve", platform: "tvos", nativeHLS: true, dvProfile: 8, want: VideoSampleEntryDVH1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req := validStartRequestV3()
+			req.ClientPlaybackContext.Device.Platform = test.platform
+			req.ClientPlaybackContext.AppBuild = test.appBuild
+			if test.deviceQuirks {
+				req.ClientFeatures = append(req.ClientFeatures, FeatureDeviceQuirksV3)
+			}
+			if test.nativeHLS {
+				hls := req.ClientPlaybackContext.Deliveries[DeliveryClassHLSV3]
+				hls.Features = append(hls.Features, ClientNativeHLSPlaybackV3)
+				req.ClientPlaybackContext.Deliveries[DeliveryClassHLSV3] = hls
+			}
+			source := SourceDescriptorV3{VideoCodec: "hevc", DVProfile: test.dvProfile}
+			if got := hlsVideoSampleEntryV3(source, req, test.dvStrip); got != test.want {
+				t.Fatalf("sample entry = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestPlanPlaybackV3AndroidMedia3HLSRecipesAcrossSourceQualities(t *testing.T) {
+	profiles := []struct {
+		name           string
+		profile        int
+		compatibility  int
+		videoRangeType string
+		hdr            *HDRCapabilitiesV3
+		wantEntry      string
+	}{
+		{name: "Profile 7 strip", profile: 7, compatibility: 6, videoRangeType: "DOVIWithEL", hdr: &HDRCapabilitiesV3{HDR10: true}, wantEntry: VideoSampleEntryHVC1},
+		{name: "Profile 8 preserve", profile: 8, compatibility: 1, videoRangeType: "DOVIWithHDR10", hdr: &HDRCapabilitiesV3{DolbyVisionProfiles: []int{8}, DolbyVisionProfileLevels: []DolbyVisionProfileCapabilityV3{{Profile: 8, MaxLevel: 6, BLCompatibilityIDs: []int{1}}}}, wantEntry: VideoSampleEntryDVH1},
+	}
+	for _, profile := range profiles {
+		for _, quality := range []string{"auto", QualityOriginalV3, "2160p"} {
+			t.Run(profile.name+"/"+quality, func(t *testing.T) {
+				file := detailedFixtureFileV3()
+				file.CodecAudio = "truehd"
+				file.AudioChannels = 8
+				file.AudioTracks[0] = models.AudioTrack{Codec: "truehd", Channels: 8, Layout: "7.1", Default: true}
+				file.VideoTracks[0].DVProfile = profile.profile
+				file.VideoTracks[0].DVBLCompatID = profile.compatibility
+				file.VideoTracks[0].DVLevel = 6
+				file.VideoTracks[0].ColorTransfer = "smpte2084"
+				file.VideoTracks[0].VideoRange = "DolbyVision"
+				file.VideoTracks[0].VideoRangeType = profile.videoRangeType
+
+				req := validStartRequestV3()
+				req.QualityPreference = quality
+				req.ClientPlaybackContext.Device.Platform = "android"
+				req.ClientPlaybackContext.AppBuild = legacyAndroidMedia3HLSBuildV3
+				req.ClientFeatures = append(req.ClientFeatures, FeatureDeviceQuirksV3)
+				req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{Codec: "hevc", Profiles: []string{"main 10"}, Levels: []int{153}, BitDepths: []int{10}, MaxWidth: 3840, MaxHeight: 2160, MaxFrameRate: 60, MaxBitrateKbps: 80_000, Hardware: true}}
+				req.Capabilities.HDRDetails = profile.hdr
+				req.ClientPlaybackContext.Output.HDRDetails = profile.hdr
+				delete(req.ClientPlaybackContext.Deliveries, DeliveryClassOriginalHTTPV3)
+				delete(req.ClientPlaybackContext.Deliveries, DeliveryClassProgressiveV3)
+				hls := req.ClientPlaybackContext.Deliveries[DeliveryClassHLSV3]
+				hls.VideoCodecs = []string{"hevc"}
+				hls.AudioDecodeCodecs = []string{"aac"}
+				hls.HDRDetails = profile.hdr
+				req.ClientPlaybackContext.Deliveries[DeliveryClassHLSV3] = hls
+
+				result := PlanPlaybackV3(PlannerInputV3{
+					Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+					Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true}, Registry: testTransformationRegistryV3(),
+				})
+				if result.Plan == nil || result.Plan.Delivery != DeliveryRemuxHLSV3 || result.TargetVideoCodec != "copy" || !result.TranscodeAudio {
+					t.Fatalf("result = %s", ExplainPlannerResultV3(result))
+				}
+				if got := result.Plan.EffectiveRecipe.VideoSampleEntry; got != profile.wantEntry {
+					t.Fatalf("sample entry = %q, want %q", got, profile.wantEntry)
+				}
+			})
+		}
 	}
 }
 
@@ -3337,6 +3454,125 @@ func TestPlanPlaybackV3VideoRemuxAdaptsProgressiveWhenHLSVideoUnsupported(t *tes
 	})
 	if result.Plan == nil || result.Plan.Delivery != DeliveryRemuxProgressiveV3 || !result.TranscodeAudio || result.TargetAudioCodec != "aac" {
 		t.Fatalf("result = %s", ExplainPlannerResultV3(result))
+	}
+}
+
+func TestPlanPlaybackV3MatroskaAACRemuxUsesTimestampNormalizedAudio(t *testing.T) {
+	file := detailedFixtureFileV3()
+	file.CodecVideo = "h264"
+	file.Resolution = "1080p"
+	file.Bitrate = 4_244
+	file.VideoTracks[0] = models.VideoTrack{Codec: "h264", Profile: "High", Level: 40, Width: 1920, Height: 804, FrameRate: "25", BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR"}
+	file.AudioTracks[0] = models.AudioTrack{Codec: "aac", Channels: 2, Layout: "stereo", SampleRate: 48_000}
+
+	req := validStartRequestV3()
+	req.Capabilities.VideoEvidence = EvidenceDeclaredV3
+	req.Capabilities.AudioEvidence = EvidenceDeclaredV3
+	req.ClientPlaybackContext.FormFactor = "desktop"
+	req.ClientPlaybackContext.Device = DeviceContextV3{Platform: "web", PlatformDetails: map[string]string{"user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:154.0) Gecko/20100101 Firefox/154.0"}}
+	req.Capabilities.CodecsVideo = []string{"h264"}
+	req.Capabilities.CodecsAudio = []string{"aac"}
+	req.Capabilities.Containers = []string{"mp4"}
+	req.Capabilities.MaxResolution = "1080p"
+	delete(req.ClientPlaybackContext.Deliveries, DeliveryClassOriginalHTTPV3)
+	for _, delivery := range []string{DeliveryClassProgressiveV3, DeliveryClassHLSV3} {
+		capability := req.ClientPlaybackContext.Deliveries[delivery]
+		if delivery == DeliveryClassProgressiveV3 {
+			capability.Containers = []string{"mp4"}
+		} else {
+			capability.Containers = []string{"hls"}
+		}
+		capability.VideoCodecs = []string{"h264"}
+		capability.AudioDecodeCodecs = []string{"aac"}
+		req.ClientPlaybackContext.Deliveries[delivery] = capability
+	}
+
+	result := PlanPlaybackV3(PlannerInputV3{
+		Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+		Settings: PlannerSettingsV3{TranscodeEnabled: true}, Registry: testTransformationRegistryV3(),
+	})
+	if result.Plan == nil || result.Plan.Delivery != DeliveryRemuxProgressiveV3 || result.PlayMethod != PlayRemux || !result.TranscodeAudio || result.TargetAudioCodec != "aac" {
+		t.Fatalf("result = %s", ExplainPlannerResultV3(result))
+	}
+	if result.Plan.DecisionReason != decisionReasonAudioAdaptationV3 || len(result.Plan.Transformations) != 1 || result.Plan.Transformations[0].Name != TransformationAudioToAACV3 || result.Plan.Transformations[0].RecipeVersion != TransformationAudioToAACRecipeVersionV3 || len(result.Plan.AppliedQuirks) != 1 || result.Plan.AppliedQuirks[0].ID != QuirkFirefoxMatroskaAACTimingV3 {
+		t.Fatalf("normalized AAC plan = %#v", result.Plan)
+	}
+}
+
+func TestPlanPlaybackV3NativeMatroskaAACDirectPlayRemainsUnchanged(t *testing.T) {
+	file := detailedFixtureFileV3()
+	file.VideoTracks[0].VideoRange = "SDR"
+	file.VideoTracks[0].VideoRangeType = "SDR"
+	req := validStartRequestV3()
+	req.Capabilities.VideoEvidence = EvidenceDeclaredV3
+	req.Capabilities.AudioEvidence = EvidenceDeclaredV3
+	req.ClientPlaybackContext.FormFactor = "desktop"
+	req.ClientPlaybackContext.Device = DeviceContextV3{Platform: "web", PlatformDetails: map[string]string{"user_agent": "Mozilla/5.0 Firefox/154.0"}}
+	original := req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3]
+	original.Containers = []string{"mkv"}
+	original.VideoCodecs = []string{"hevc"}
+	original.AudioDecodeCodecs = []string{"aac"}
+	req.ClientPlaybackContext.Deliveries[DeliveryClassOriginalHTTPV3] = original
+
+	result := PlanPlaybackV3(PlannerInputV3{
+		Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+		Settings: PlannerSettingsV3{TranscodeEnabled: true}, Registry: testTransformationRegistryV3(),
+	})
+	if result.Plan == nil || result.Plan.Delivery != DeliveryOriginalHTTPV3 || result.PlayMethod != PlayDirect || result.TranscodeAudio || len(result.Plan.Transformations) != 0 {
+		t.Fatalf("direct play changed = %s", ExplainPlannerResultV3(result))
+	}
+}
+
+func TestPlanPlaybackV3FirefoxIncompatibleAudioCodecsUseNormalizedAACRecipe(t *testing.T) {
+	for _, test := range []struct {
+		codec    string
+		channels int
+	}{
+		{codec: "dts", channels: 6},
+		{codec: "eac3", channels: 6},
+		{codec: "ac3", channels: 6},
+		{codec: "truehd", channels: 8},
+		{codec: "opus", channels: 2},
+		{codec: "vorbis", channels: 2},
+		{codec: "flac", channels: 2},
+	} {
+		t.Run(test.codec, func(t *testing.T) {
+			file := detailedFixtureFileV3()
+			file.CodecVideo = "h264"
+			file.CodecAudio = test.codec
+			file.Resolution = "1080p"
+			file.VideoTracks[0] = models.VideoTrack{Codec: "h264", Profile: "High", Level: 40, Width: 1920, Height: 1080, FrameRate: "24", BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR"}
+			file.AudioTracks[0] = models.AudioTrack{Codec: test.codec, Channels: test.channels}
+
+			req := validStartRequestV3()
+			req.Capabilities.VideoEvidence = EvidenceDeclaredV3
+			req.Capabilities.AudioEvidence = EvidenceDeclaredV3
+			req.ClientPlaybackContext.FormFactor = "desktop"
+			req.ClientPlaybackContext.Device = DeviceContextV3{Platform: "web", PlatformDetails: map[string]string{"user_agent": "Mozilla/5.0 Firefox/154.0"}}
+			req.Capabilities.CodecsVideo = []string{"h264"}
+			req.Capabilities.CodecsAudio = []string{"aac"}
+			req.Capabilities.Containers = []string{"mp4"}
+			delete(req.ClientPlaybackContext.Deliveries, DeliveryClassOriginalHTTPV3)
+			for _, delivery := range []string{DeliveryClassProgressiveV3, DeliveryClassHLSV3} {
+				capability := req.ClientPlaybackContext.Deliveries[delivery]
+				if delivery == DeliveryClassProgressiveV3 {
+					capability.Containers = []string{"mp4"}
+				} else {
+					capability.Containers = []string{"hls"}
+				}
+				capability.VideoCodecs = []string{"h264"}
+				capability.AudioDecodeCodecs = []string{"aac"}
+				req.ClientPlaybackContext.Deliveries[delivery] = capability
+			}
+
+			result := PlanPlaybackV3(PlannerInputV3{
+				Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+				Settings: PlannerSettingsV3{TranscodeEnabled: true}, Registry: testTransformationRegistryV3(),
+			})
+			if result.Plan == nil || result.PlayMethod != PlayRemux || !result.TranscodeAudio || result.TargetAudioCodec != "aac" || len(result.Plan.Transformations) != 1 || result.Plan.Transformations[0].RecipeVersion != TransformationAudioToAACRecipeVersionV3 {
+				t.Fatalf("result = %s", ExplainPlannerResultV3(result))
+			}
+		})
 	}
 }
 

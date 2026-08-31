@@ -21,6 +21,7 @@ type PlannerSettingsV3 struct {
 const (
 	TerminalMessage4KTranscodeDisabledV3   = "A lower-resolution source is required because 4K transcoding is disabled."
 	containerMP4V3                         = "mp4"
+	containerMKVV3                         = "mkv"
 	mimeVideoMP4V3                         = "video/mp4"
 	degradationAudioConvertedV3            = "audio_converted"
 	audioCodecAACV3                        = "aac"
@@ -40,23 +41,22 @@ type PlannerInputV3 struct {
 	AudioTrackIndex int
 	Settings        PlannerSettingsV3
 	// Registry holds the transformations the local binary can execute.
-	// Progressive remux routes always gate on it: they run in this process.
 	Registry *TransformationRegistryV3
-	// HLSRegistry optionally widens transformation availability for HLS
-	// deliveries, which can execute on pooled transcode nodes as well as
-	// locally. Nil means HLS routes gate on Registry alone. It is a lazy
-	// producer because building the widened registry can touch the network
-	// (node capability fetches): the planner only invokes it when a route
-	// decision genuinely depends on node capabilities, so direct-play and
-	// other source-preserving starts never pay for it. Producers must
-	// return a superset of Registry (local ∪ node capabilities) and should
-	// memoize; the transport layer re-validates whichever executor is
-	// actually selected.
-	HLSRegistry func() *TransformationRegistryV3
+	// ProgressiveRemuxRegistry, HLSRemuxRegistry, and HLSVideoRegistry report
+	// the transformations executable by policy-eligible routes for each
+	// delivery. They are lazy because building a registry can touch pooled
+	// nodes. The planner only invokes the producer when that delivery needs a
+	// server transformation, and the transport layer re-validates the selected
+	// executor. HLSRegistry is the legacy shared fallback used when a caller
+	// does not provide workload-specific HLS registries.
+	ProgressiveRemuxRegistry func() *TransformationRegistryV3
+	HLSRemuxRegistry         func() *TransformationRegistryV3
+	HLSVideoRegistry         func() *TransformationRegistryV3
+	HLSRegistry              func() *TransformationRegistryV3
 	// ToneMapCapabilities and HLSToneMapCapabilities mirror Registry and
-	// HLSRegistry for executor variants of hdr_to_sdr_tonemap. The public plan
-	// names one stable transformation; these internal capabilities select a
-	// validated hardware or software implementation without exposing that
+	// HLSVideoRegistry for executor variants of hdr_to_sdr_tonemap. The public
+	// plan names one stable transformation; these internal capabilities select
+	// a validated hardware or software implementation without exposing that
 	// deployment policy to clients.
 	ToneMapCapabilities    tonemap.Capabilities
 	HLSToneMapCapabilities func() tonemap.Capabilities
@@ -65,7 +65,7 @@ type PlannerInputV3 struct {
 	// carries the transformation; this answers whether the file does, which
 	// no capability probe can. Nil means "assume it does", preserving the
 	// pre-probe behaviour for callers that cannot run one (the shadow
-	// planner, tests). Lazy for the same reason as HLSRegistry: it shells out
+	// planner, tests). Lazy for the same reason as the HLS registries: it shells out
 	// to ffmpeg, so it is consulted only once every cheap eligibility gate
 	// has already passed and a strip route is genuinely on the table.
 	DVRPUStrippable     func() bool
@@ -108,6 +108,29 @@ func (input PlannerInputV3) hlsRegistry() *TransformationRegistryV3 {
 		}
 	}
 	return input.Registry
+}
+
+func (input PlannerInputV3) progressiveRemuxRegistry() *TransformationRegistryV3 {
+	if input.ProgressiveRemuxRegistry != nil {
+		if registry := input.ProgressiveRemuxRegistry(); registry != nil {
+			return registry
+		}
+	}
+	return input.Registry
+}
+
+func (input PlannerInputV3) hlsRemuxRegistry() *TransformationRegistryV3 {
+	if input.HLSRemuxRegistry != nil {
+		return input.HLSRemuxRegistry()
+	}
+	return input.hlsRegistry()
+}
+
+func (input PlannerInputV3) hlsVideoRegistry() *TransformationRegistryV3 {
+	if input.HLSVideoRegistry != nil {
+		return input.HLSVideoRegistry()
+	}
+	return input.hlsRegistry()
 }
 
 type PlannerResultV3 struct {
@@ -218,16 +241,23 @@ func PlanPlaybackV3(input PlannerInputV3) PlannerResultV3 {
 	}
 	containerOK := containsFoldV3(input.Request.Capabilities.Containers, source.Container)
 	hlsDeliveryOK := deliveryAvailableV3(input.Request, DeliveryClassHLSV3)
-	// DV strip eligibility is split by executor pool: a progressive remux
-	// executes on this process's ffmpeg, while an HLS remux may run on a
-	// pooled transcode node advertising the transformation. Node capability
-	// only counts when the client can actually run an HLS delivery, and the
-	// widened registry is consulted lazily so non-DV sources never touch it.
-	dvStripEligibleLocal := canStripDolbyVisionToHDR10V3(source, input.Request, input.Registry)
-	dvStripEligible := dvStripEligibleLocal
-	if !dvStripEligible && hlsDeliveryOK && source.DynamicRange == DynamicRangeDolbyVisionV3 {
-		dvStripEligible = canStripDolbyVisionToHDR10V3(source, input.Request, input.hlsRegistry())
+	// DV strip eligibility is split by delivery because progressive proxy nodes
+	// and HLS transcode nodes are different executor pools. Keep each verdict
+	// scoped so one pool cannot authorize a recipe that only the other can run.
+	dvStripEligibleProgressive := false
+	dvStripEligibleHLS := false
+	dvStripPlausible := source.DynamicRange == DynamicRangeDolbyVisionV3 &&
+		clientSupportsHDR10V3(input.Request) &&
+		(source.DVProfile == 7 || source.DVProfile == 8 && source.DVBLCompatID == 1)
+	if dvStripPlausible {
+		if deliveryAvailableV3(input.Request, DeliveryClassProgressiveV3) {
+			dvStripEligibleProgressive = canStripDolbyVisionToHDR10V3(source, input.Request, input.progressiveRemuxRegistry())
+		}
+		if hlsDeliveryOK {
+			dvStripEligibleHLS = canStripDolbyVisionToHDR10V3(source, input.Request, input.hlsRemuxRegistry())
+		}
 	}
+	dvStripEligible := dvStripEligibleProgressive || dvStripEligibleHLS
 	// A source whose RPU ffmpeg cannot parse must lose the strip here rather
 	// than at the transport, so that the plan's HDR10 promise, the durable
 	// session's RemuxDVMode and every restart derived from it stay consistent
@@ -237,7 +267,8 @@ func PlanPlaybackV3(input PlannerInputV3) PlannerResultV3 {
 	if dvStripEligible && !input.dvRPUStrippable() {
 		dvStripUnsupportedBySource = true
 		dvStripEligible = false
-		dvStripEligibleLocal = false
+		dvStripEligibleProgressive = false
+		dvStripEligibleHLS = false
 	}
 	clientDV81Eligible := canClientTransformDV7ToDV81V3(source, input.Request)
 	clientHDR10Eligible := canClientTransformDV7ToHDR10V3(source, input.Request)
@@ -429,20 +460,26 @@ func PlanPlaybackV3(input PlannerInputV3) PlannerResultV3 {
 		progressiveAudioOK := noAudioTrack || deliverySupportsAudioClaimV3(input.Request, DeliveryClassProgressiveV3, source.AudioCodec, audioClaims, audioOK)
 		hlsAudioOK := noAudioTrack || hlsNativeAudioCodecV3(source.AudioCodec) &&
 			deliverySupportsAudioClaimV3(input.Request, DeliveryClassHLSV3, source.AudioCodec, audioClaims, audioOK)
-		progressiveTranscodeAudio := !progressiveAudioOK
-		hlsTranscodeAudio := !hlsAudioOK
+		// AAC frames in Matroska use a millisecond packet clock while each frame
+		// contains 1024 samples. Copying those rounded timestamps into MP4/fMP4
+		// produces real sub-frame gaps and overlaps that Firefox renders as
+		// crackle. Keep video-copy remuxing, but re-encode the selected AAC track
+		// through the versioned timestamp-normalization recipe. Native original
+		// playback above remains byte-for-byte direct play.
+		firefoxAACTimingQuirk, normalizeMatroskaAAC := firefoxMatroskaAACTimingQuirkV3(source, input.Request)
+		progressiveTranscodeAudio := !progressiveAudioOK || normalizeMatroskaAAC
+		hlsTranscodeAudio := !hlsAudioOK || normalizeMatroskaAAC
 		hlsAudioQuirk, hlsAudioQuirkOK := hlsEAC3AudioCorrectionV3(source, input.Request)
-		localAudioConvertOK := input.Registry.Available(TransformationAudioToAACV3)
+		progressiveAudioConvertOK := false
+		if progressiveTranscodeAudio && deliveryAvailableV3(input.Request, DeliveryClassProgressiveV3) {
+			progressiveAudioConvertOK = input.progressiveRemuxRegistry().Available(TransformationAudioToAACV3)
+		}
 		if progressiveTranscodeAudio && hlsTranscodeAudio {
-			// The HLS remux branch below can offload the conversion to a
-			// pooled node, but only for clients that can run an HLS
-			// delivery: a progressive-only client must keep this terminal
-			// (its retryable semantics included) rather than fall through
-			// to a generic adaptation_unavailable for a route it can never
-			// use. Short-circuit order keeps locally-capable planning from
-			// consulting node capabilities at all.
-			audioConvertOK := localAudioConvertOK ||
-				hlsDeliveryOK && input.hlsRegistry().Available(TransformationAudioToAACV3)
+			// Each delivery consults only its own eligible executor pool. A
+			// progressive proxy may run the conversion without implying that an
+			// HLS transcode node can, and vice versa.
+			audioConvertOK := progressiveAudioConvertOK ||
+				hlsDeliveryOK && input.hlsRemuxRegistry().Available(TransformationAudioToAACV3)
 			if !audioConvertOK {
 				return terminalPlannerResultV3(TerminalAudioConversionUnsupportedV3, "The required validated AAC conversion toolchain is unavailable.", true)
 			}
@@ -461,7 +498,7 @@ func PlanPlaybackV3(input PlannerInputV3) PlannerResultV3 {
 		progressivePlan.Stream = StreamV3{Protocol: StreamHTTPProgressiveV3, Container: containerMP4V3, MIMEType: mimeVideoMP4V3, Headers: map[string]string{}, HeaderRefresh: HeaderRefreshNoneV3}
 		progressivePlan.DecisionReason = decisionReasonContainerNormalizationV3
 		progressiveAudioChannels := 0
-		if progressiveTranscodeAudio && localAudioConvertOK {
+		if progressiveTranscodeAudio && progressiveAudioConvertOK {
 			progressiveAudioChannels = aacOutputChannelsV3(input.Request, DeliveryClassProgressiveV3, source.AudioChannels, false)
 			progressivePlan.EffectiveRecipe.AudioCodec = audioCodecAACV3
 			progressivePlan.EffectiveRecipe.AudioChannels = intPointerV3(progressiveAudioChannels)
@@ -471,14 +508,13 @@ func PlanPlaybackV3(input PlannerInputV3) PlannerResultV3 {
 			progressivePlan.DegradationWarnings = append(progressivePlan.DegradationWarnings, DegradationWarningV3{Code: degradationAudioConvertedV3, Message: fmt.Sprintf("The selected audio track is converted to AAC %s.", audioLayoutForChannelsV3(progressiveAudioChannels))})
 			progressivePlan.DecisionReason = decisionReasonAudioAdaptationV3
 		}
+		if normalizeMatroskaAAC {
+			appendAppliedQuirkV3(&progressivePlan, *firefoxAACTimingQuirk, "")
+		}
 		if !dvStrip {
 			applyCopiedVideoQuirksV3(&progressivePlan, source, input.Request, high10Quirk)
 		}
-		// The progressive remux executes on this process's ffmpeg, so its
-		// server transformations must be locally available; when only pooled
-		// nodes carry them, the HLS remux below ships the same recipe on a
-		// node-offloadable delivery instead.
-		progressiveExecutable := (!progressiveTranscodeAudio || localAudioConvertOK) && (!dvStrip || dvStripEligibleLocal)
+		progressiveExecutable := (!progressiveTranscodeAudio || progressiveAudioConvertOK) && (!dvStrip || dvStripEligibleProgressive)
 		tryProgressive := func() (PlannerResultV3, bool) {
 			if !remuxSubtitleOK || !progressiveExecutable {
 				return PlannerResultV3{}, false
@@ -498,13 +534,14 @@ func PlanPlaybackV3(input PlannerInputV3) PlannerResultV3 {
 				return result
 			}
 		}
-		if deliveryAvailableV3(input.Request, DeliveryClassHLSV3) && hlsRemuxSubtitleOK {
+		if deliveryAvailableV3(input.Request, DeliveryClassHLSV3) && hlsRemuxSubtitleOK && (!dvStrip || dvStripEligibleHLS) {
 			plan := cloneRemuxPlanCandidateV3(remuxBase)
 			plan.Delivery = DeliveryRemuxHLSV3
 			plan.Stream = StreamV3{Protocol: StreamHLSV3, Container: "hls", MIMEType: "application/vnd.apple.mpegurl", Headers: map[string]string{}, HeaderRefresh: HeaderRefreshNoneV3}
+			plan.EffectiveRecipe.VideoSampleEntry = hlsVideoSampleEntryV3(source, input.Request, dvStrip)
 			hlsAudioChannels := 0
 			if hlsTranscodeAudio {
-				if !input.hlsRegistry().Available(TransformationAudioToAACV3) {
+				if !input.hlsRemuxRegistry().Available(TransformationAudioToAACV3) {
 					return terminalPlannerResultV3(TerminalAudioConversionUnsupportedV3, "The HLS route requires the validated AAC conversion toolchain.", true)
 				}
 				// HLS packaging cannot safely copy non-native codecs such as
@@ -519,8 +556,11 @@ func PlanPlaybackV3(input PlannerInputV3) PlannerResultV3 {
 				plan.Transformations = append(plan.Transformations, TransformationV3{Name: TransformationAudioToAACV3, Executor: ExecutorServerV3, RecipeVersion: TransformationAudioToAACRecipeVersionV3, ValidatedClaims: []string{ClaimAudioDecodeV3}})
 				plan.DegradationWarnings = append(plan.DegradationWarnings, DegradationWarningV3{Code: degradationAudioConvertedV3, Message: "The selected audio track is converted to AAC for HLS delivery."})
 			}
+			if normalizeMatroskaAAC {
+				appendAppliedQuirkV3(&plan, *firefoxAACTimingQuirk, "")
+			}
 			if hlsAudioQuirkOK && !hlsTranscodeAudio {
-				if !input.hlsRegistry().Available(TransformationAudioToAACV3) {
+				if !input.hlsRemuxRegistry().Available(TransformationAudioToAACV3) {
 					return terminalPlannerResultV3(TerminalAudioConversionUnsupportedV3, "The device-specific HLS route requires the validated AAC conversion toolchain.", true)
 				}
 				hlsTranscodeAudio = true
@@ -563,6 +603,23 @@ func PlanPlaybackV3(input PlannerInputV3) PlannerResultV3 {
 	}
 
 	return terminalPlannerResultV3("adaptation_unavailable", "No validated playback route is available for this source and output route.", false)
+}
+
+// Native HLS consumers use hvc1/dvh1 byte recipes. Web MediaSource clients
+// keep the server's existing FFmpeg-default labeling unless they explicitly
+// advertise the delivery-scoped native-HLS feature.
+func hlsVideoSampleEntryV3(source SourceDescriptorV3, request StartRequestV3, dvStrip bool) string {
+	if !strings.EqualFold(source.VideoCodec, "hevc") {
+		return ""
+	}
+	if !deliverySupportsFeatureV3(request, DeliveryClassHLSV3, ClientNativeHLSPlaybackV3) &&
+		!usesFirstPartyAndroidMedia3HLSV3(request) {
+		return ""
+	}
+	if !dvStrip && (source.DVProfile == 5 || source.DVProfile == 8) {
+		return VideoSampleEntryDVH1
+	}
+	return VideoSampleEntryHVC1
 }
 
 // availableQualitiesV3 publishes the server ladder rungs a client could
@@ -685,8 +742,12 @@ func planAudioOnlyV3(input PlannerInputV3, file *models.MediaFile, source Source
 		return terminalPlannerResultV3("adaptation_unavailable", "No validated playback route is available for this audio source.", false)
 	}
 	transcodeAudio := !audioOK || bandwidthCapExceeded
-	if transcodeAudio && (input.Registry == nil || !input.Registry.Available(TransformationAudioToAACV3)) {
-		return terminalPlannerResultV3(TerminalAudioConversionUnsupportedV3, "The required validated AAC conversion toolchain is unavailable.", true)
+	var progressiveRegistry *TransformationRegistryV3
+	if transcodeAudio {
+		progressiveRegistry = input.progressiveRemuxRegistry()
+		if progressiveRegistry == nil || !progressiveRegistry.Available(TransformationAudioToAACV3) {
+			return terminalPlannerResultV3(TerminalAudioConversionUnsupportedV3, "The required validated AAC conversion toolchain is unavailable.", true)
+		}
 	}
 	plan := base
 	plan.Delivery = DeliveryRemuxProgressiveV3
@@ -701,13 +762,16 @@ func planAudioOnlyV3(input PlannerInputV3, file *models.MediaFile, source Source
 	if transcodeAudio {
 		targetAudioBitrateKbps = audioOnlyAACBitrateKbpsV3(bandwidthCapKbps)
 		applyAudioOnlyAACConversionV3(&plan, targetAudioChannels, targetAudioBitrateKbps, bandwidthCapExceeded)
-	} else if !deliverySupportsPlanV3(request, DeliveryClassProgressiveV3, plan) && input.Registry != nil && input.Registry.Available(TransformationAudioToAACV3) {
-		converted := plan
-		targetAudioBitrateKbps = audioOnlyAACBitrateKbpsV3(bandwidthCapKbps)
-		applyAudioOnlyAACConversionV3(&converted, targetAudioChannels, targetAudioBitrateKbps, false)
-		if deliverySupportsPlanV3(request, DeliveryClassProgressiveV3, converted) {
-			plan = converted
-			transcodeAudio = true
+	} else if !deliverySupportsPlanV3(request, DeliveryClassProgressiveV3, plan) {
+		progressiveRegistry = input.progressiveRemuxRegistry()
+		if progressiveRegistry != nil && progressiveRegistry.Available(TransformationAudioToAACV3) {
+			converted := plan
+			targetAudioBitrateKbps = audioOnlyAACBitrateKbpsV3(bandwidthCapKbps)
+			applyAudioOnlyAACConversionV3(&converted, targetAudioChannels, targetAudioBitrateKbps, false)
+			if deliverySupportsPlanV3(request, DeliveryClassProgressiveV3, converted) {
+				plan = converted
+				transcodeAudio = true
+			}
 		}
 	}
 	if !deliverySupportsPlanV3(request, DeliveryClassProgressiveV3, plan) {
@@ -836,7 +900,7 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 		return terminalPlannerResultV3("no_alternate_version", TerminalMessage4KTranscodeDisabledV3, false)
 	}
 	if hlsRegistry == nil {
-		hlsRegistry = input.hlsRegistry()
+		hlsRegistry = input.hlsVideoRegistry()
 	}
 	if hlsRegistry == nil || !hlsRegistry.Available(TransformationVideoToH264V3) || !hlsRegistry.Available(TransformationAudioToAACV3) {
 		return terminalPlannerResultV3("conversion_tool_unavailable", "The required validated H.264/AAC conversion toolchain is unavailable.", true)
@@ -1235,7 +1299,7 @@ func resolveToneMapRecipeV3(input PlannerInputV3, source SourceDescriptorV3, hls
 		return recipe
 	}
 	if hlsRegistry == nil {
-		hlsRegistry = input.hlsRegistry()
+		hlsRegistry = input.hlsVideoRegistry()
 	}
 	recipe.hlsRegistry = hlsRegistry
 	if hlsRegistry == nil || !hlsRegistry.Available(TransformationHDRToSDRToneMapV3) {
@@ -1290,7 +1354,8 @@ func videoTranscodeExecutableV3(input PlannerInputV3, source SourceDescriptorV3)
 	if hdrTranscodeUnavailableV3(input, source) {
 		return false
 	}
-	return input.hlsRegistry().Available(TransformationVideoToH264V3) && input.hlsRegistry().Available(TransformationAudioToAACV3)
+	registry := input.hlsVideoRegistry()
+	return registry.Available(TransformationVideoToH264V3) && registry.Available(TransformationAudioToAACV3)
 }
 
 func recipeFromSourceV3(source SourceDescriptorV3) EffectiveRecipeV3 {

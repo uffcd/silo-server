@@ -405,6 +405,13 @@
         "video_codec": {
           "type": "string"
         },
+        "video_sample_entry": {
+          "type": "string",
+          "enum": [
+            "hvc1",
+            "dvh1"
+          ]
+        },
         "audio_codec": {
           "type": "string"
         },

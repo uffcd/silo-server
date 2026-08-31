@@ -23,18 +23,24 @@ import (
 	"github.com/Silo-Server/silo-server/internal/clientip"
 	"github.com/Silo-Server/silo-server/internal/downloadprepare"
 	"github.com/Silo-Server/silo-server/internal/downloads"
+	"github.com/Silo-Server/silo-server/internal/httpstream"
 	"github.com/Silo-Server/silo-server/internal/nodeconfig"
 	"github.com/Silo-Server/silo-server/internal/nodemetrics"
+	"github.com/Silo-Server/silo-server/internal/noderouting"
 	"github.com/Silo-Server/silo-server/internal/nodesessions"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/streamtelemetry"
 	"github.com/Silo-Server/silo-server/internal/streamtoken"
+	"github.com/Silo-Server/silo-server/internal/transcodeproxy"
 )
 
 // Server is the HTTP handler for proxy mode.
 type Server struct {
-	watcher              *nodeconfig.Watcher
-	tracker              *nodesessions.Tracker
+	watcher *nodeconfig.Watcher
+	tracker *nodesessions.Tracker
+	// nodeRowID resolves this proxy's stable stream_nodes identity. Production
+	// uses the config watcher; tests replace it to model sibling proxies.
+	nodeRowID            func() (int, bool)
 	httpClient           *http.Client
 	artifactMissReporter remoteArtifactMissReporter
 	// grants and loginSessions back the credential-free /stream/v3 routes: the
@@ -84,7 +90,7 @@ type remoteArtifactMissReporter interface {
 // NewServer creates a new proxy server backed by a config watcher and session
 // tracker.
 func NewServer(watcher *nodeconfig.Watcher, tracker *nodesessions.Tracker) *Server {
-	return &Server{
+	server := &Server{
 		watcher: watcher,
 		tracker: tracker,
 		// No overall timeout — stream bodies are long-lived. Hung nodes are
@@ -100,6 +106,10 @@ func NewServer(watcher *nodeconfig.Watcher, tracker *nodesessions.Tracker) *Serv
 			return watcher.Config().Playback.TranscodeDir
 		}),
 	}
+	if watcher != nil {
+		server.nodeRowID = watcher.NodeRowID
+	}
+	return server
 }
 
 // SetMediaGrantAuthority wires the two dependencies the credential-free
@@ -470,9 +480,154 @@ func (s *Server) verifyToken(w http.ResponseWriter, r *http.Request) *streamtoke
 	return claims
 }
 
-func (s *Server) handleDirectPlay(w http.ResponseWriter, r *http.Request) {
+func (s *Server) verifyPlaybackToken(w http.ResponseWriter, r *http.Request) *streamtoken.Claims {
 	claims := s.verifyToken(w, r)
 	if claims == nil {
+		return nil
+	}
+	nodeID, nodeIDKnown := s.currentNodeRowID()
+	if status := proxyEgressStatusV3(
+		claims.RoutingWorkload, claims.RoutingExecution, claims.RoutingEgress,
+		claims.RoutingEgressNodeID, nodeID, nodeIDKnown,
+	); status != 0 {
+		writeProxyRouteStatusV3(w, status)
+		return nil
+	}
+	return claims
+}
+
+// proxyEgressStatusV3 enforces the media origin frozen into a routed playback
+// artifact. An entirely empty tuple predates node routing and remains usable
+// until its bounded token/grant lifetime expires; a partial tuple is an
+// uncommitted route and must not fail open on any proxy media endpoint.
+func proxyEgressStatusV3(
+	workload, execution, egress string,
+	egressNodeID, currentNodeID int,
+	currentNodeIDKnown bool,
+) int {
+	workload = strings.TrimSpace(workload)
+	execution = strings.TrimSpace(execution)
+	egress = strings.TrimSpace(egress)
+	if workload == "" && execution == "" && egress == "" && egressNodeID == 0 {
+		return 0
+	}
+	if workload == "" || execution == "" || egress == "" || egressNodeID < 0 {
+		return http.StatusConflict
+	}
+	if egress != string(noderouting.EgressProxy) {
+		return http.StatusServiceUnavailable
+	}
+	if egressNodeID == 0 {
+		return http.StatusConflict
+	}
+	if !currentNodeIDKnown || currentNodeID <= 0 || egressNodeID != currentNodeID {
+		return http.StatusServiceUnavailable
+	}
+	return 0
+}
+
+func (s *Server) currentNodeRowID() (int, bool) {
+	if s == nil || s.nodeRowID == nil {
+		return 0, false
+	}
+	return s.nodeRowID()
+}
+
+type proxyPlaybackEndpointV3 uint8
+
+const (
+	proxyPlaybackEndpointDirectV3 proxyPlaybackEndpointV3 = iota
+	proxyPlaybackEndpointRemuxV3
+	proxyPlaybackEndpointTranscodeV3
+	proxyPlaybackEndpointIdentityV3
+	proxyPlaybackEndpointAuxiliaryV3
+)
+
+// proxyPlaybackEndpointStatusV3 binds a valid proxy artifact to the serving
+// recipe family. A signed direct-play token is not authority to start remux or
+// transcode work merely because every endpoint shares the same signing key.
+func proxyPlaybackEndpointStatusV3(claims *streamtoken.Claims, endpoint proxyPlaybackEndpointV3) int {
+	if claims == nil {
+		return http.StatusServiceUnavailable
+	}
+	direct := claims.RoutingWorkload == string(noderouting.WorkloadDirectPlay) &&
+		claims.RoutingExecution == string(noderouting.ExecutionNone) &&
+		claims.RoutingEgress == string(noderouting.EgressProxy) &&
+		claims.PlayMethod == string(playback.PlayDirect)
+	remux := claims.RoutingWorkload == string(noderouting.WorkloadRemux) &&
+		claims.RoutingExecution == string(noderouting.ExecutionProxy) &&
+		claims.RoutingEgress == string(noderouting.EgressProxy) &&
+		proxyRemuxPlayMethodV3(claims.PlayMethod)
+	transcode := (claims.RoutingWorkload == string(noderouting.WorkloadRemux) ||
+		claims.RoutingWorkload == string(noderouting.WorkloadVideoTranscode)) &&
+		claims.RoutingExecution == string(noderouting.ExecutionTranscode) &&
+		claims.RoutingEgress == string(noderouting.EgressProxy) &&
+		proxyTranscodePlayMethodV3(claims.PlayMethod)
+
+	// Tokens from the released pre-routing server have no tuple. They retain
+	// only their original method authority during the bounded token lifetime.
+	legacy := claims.RoutingWorkload == "" && claims.RoutingExecution == "" &&
+		claims.RoutingEgress == "" && claims.RoutingEgressNodeID == 0
+	if legacy {
+		direct = claims.PlayMethod == string(playback.PlayDirect)
+		remux = proxyRemuxPlayMethodV3(claims.PlayMethod)
+		transcode = proxyTranscodePlayMethodV3(claims.PlayMethod)
+	}
+
+	allowed := false
+	switch endpoint {
+	case proxyPlaybackEndpointDirectV3:
+		allowed = direct
+	case proxyPlaybackEndpointRemuxV3:
+		allowed = remux
+	case proxyPlaybackEndpointTranscodeV3:
+		allowed = transcode
+	case proxyPlaybackEndpointIdentityV3:
+		allowed = direct || remux
+	case proxyPlaybackEndpointAuxiliaryV3:
+		allowed = direct || remux || transcode
+	}
+	if !allowed {
+		return http.StatusServiceUnavailable
+	}
+	return 0
+}
+
+func proxyRemuxPlayMethodV3(method string) bool {
+	return method == string(playback.PlayRemux) || method == streamtoken.PlayMethodAudioDownmixRemux
+}
+
+func proxyTranscodePlayMethodV3(method string) bool {
+	switch method {
+	case "", string(playback.PlayTranscode), streamtoken.PlayMethodToneMapTranscode,
+		streamtoken.PlayMethodAudioDownmixTranscode, streamtoken.PlayMethodCopyFMP4Transcode:
+		return true
+	default:
+		return false
+	}
+}
+
+func requireProxyPlaybackEndpointV3(w http.ResponseWriter, claims *streamtoken.Claims, endpoint proxyPlaybackEndpointV3) bool {
+	status := proxyPlaybackEndpointStatusV3(claims, endpoint)
+	if status != 0 {
+		writeProxyRouteStatusV3(w, status)
+		return false
+	}
+	return true
+}
+
+func writeProxyRouteStatusV3(w http.ResponseWriter, status int) {
+	switch status {
+	case http.StatusConflict:
+		http.Error(w, "playback route unbound", status)
+	default:
+		http.Error(w, "routing policy unsatisfied", status)
+	}
+}
+
+func (s *Server) handleDirectPlay(w http.ResponseWriter, r *http.Request) {
+	claims := s.verifyPlaybackToken(w, r)
+	if claims == nil || !requireProxyPlaybackEndpointV3(w, claims, proxyPlaybackEndpointDirectV3) {
 		return
 	}
 	s.serveDirectPlayClaims(w, r, claims)
@@ -638,8 +793,8 @@ func (s *Server) downloadBandwidthManager() *downloads.BandwidthManager {
 }
 
 func (s *Server) handleRemux(w http.ResponseWriter, r *http.Request) {
-	claims := s.verifyToken(w, r)
-	if claims == nil {
+	claims := s.verifyPlaybackToken(w, r)
+	if claims == nil || !requireProxyPlaybackEndpointV3(w, claims, proxyPlaybackEndpointRemuxV3) {
 		return
 	}
 	// A boosted recipe must use the versioned route below. Keeping it off the
@@ -654,8 +809,8 @@ func (s *Server) handleRemux(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAudioV2Remux(w http.ResponseWriter, r *http.Request) {
-	claims := s.verifyToken(w, r)
-	if claims == nil {
+	claims := s.verifyPlaybackToken(w, r)
+	if claims == nil || !requireProxyPlaybackEndpointV3(w, claims, proxyPlaybackEndpointRemuxV3) {
 		return
 	}
 	// The endpoint attests the audio_to_aac v2 execution contract, not merely a
@@ -709,8 +864,8 @@ func (s *Server) serveRemuxClaims(w http.ResponseWriter, r *http.Request, claims
 }
 
 func (s *Server) handleTranscodeManifest(w http.ResponseWriter, r *http.Request) {
-	claims := s.verifyToken(w, r)
-	if claims == nil {
+	claims := s.verifyPlaybackToken(w, r)
+	if claims == nil || !requireProxyPlaybackEndpointV3(w, claims, proxyPlaybackEndpointTranscodeV3) {
 		return
 	}
 	attachStream(r.Context(), claims)
@@ -719,8 +874,8 @@ func (s *Server) handleTranscodeManifest(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) handleTranscodeSegment(w http.ResponseWriter, r *http.Request) {
-	claims := s.verifyToken(w, r)
-	if claims == nil {
+	claims := s.verifyPlaybackToken(w, r)
+	if claims == nil || !requireProxyPlaybackEndpointV3(w, claims, proxyPlaybackEndpointTranscodeV3) {
 		return
 	}
 	attachStream(r.Context(), claims)
@@ -769,8 +924,8 @@ func sessionInfo(tr *nodesessions.Tracker, claims *streamtoken.Claims, kind stri
 }
 
 func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
-	claims := s.verifyToken(w, r)
-	if claims == nil {
+	claims := s.verifyPlaybackToken(w, r)
+	if claims == nil || !requireProxyPlaybackEndpointV3(w, claims, proxyPlaybackEndpointAuxiliaryV3) {
 		return
 	}
 	attachStream(r.Context(), claims)
@@ -843,8 +998,8 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSubtitleFonts(w http.ResponseWriter, r *http.Request) {
-	claims := s.verifyToken(w, r)
-	if claims == nil {
+	claims := s.verifyPlaybackToken(w, r)
+	if claims == nil || !requireProxyPlaybackEndpointV3(w, claims, proxyPlaybackEndpointAuxiliaryV3) {
 		return
 	}
 	attachStream(r.Context(), claims)
@@ -882,6 +1037,9 @@ func (s *Server) proxyToTranscodeNode(w http.ResponseWriter, r *http.Request, cl
 	}
 
 	targetURL := claims.TranscodeNode + path
+	isSegmentRoute := strings.Contains(path, "/segment/")
+	_, segmentParseErr := playback.ParseSegmentNumber(filepath.Base(path))
+	isMediaSegment := segmentParseErr == nil
 	if rawQuery := r.URL.RawQuery; rawQuery != "" {
 		targetURL = fmt.Sprintf("%s?%s", targetURL, rawQuery)
 	}
@@ -892,6 +1050,9 @@ func (s *Server) proxyToTranscodeNode(w http.ResponseWriter, r *http.Request, cl
 		return
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.Auth.JWTSecret)
+	if isSegmentRoute {
+		transcodeproxy.PrepareRequest(req, r)
+	}
 	// Forward the verified stream token so the transcode node can self-reconstruct
 	// a lost session after its OWN restart: the token carries the full byte-affecting
 	// recipe, so the node can re-spawn ffmpeg seeked to the requested segment instead
@@ -907,16 +1068,21 @@ func (s *Server) proxyToTranscodeNode(w http.ResponseWriter, r *http.Request, cl
 		http.Error(w, "transcode node unavailable", http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
-	// Copy response headers
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
+	generation := resp.Header.Get(transcodeproxy.GenerationHeader)
+	transcodeproxy.CopyResponseHeaders(w.Header(), resp.Header)
+	sw := httpstream.NewRollingDeadlineWriter(w)
+	sw.WriteHeader(resp.StatusCode)
+	if _, copyErr := io.Copy(sw, resp.Body); copyErr != nil {
+		return
+	}
+	if isMediaSegment && generation != "" && r.Method == http.MethodGet &&
+		sw.CompletedFullResponse(transcodeproxy.FullRepresentationSize(resp)) {
+		if ackErr := transcodeproxy.Acknowledge(r.Context(), s.httpClient, claims.TranscodeNode+path, cfg.Auth.JWTSecret, generation); ackErr != nil {
+			slog.WarnContext(r.Context(), "acknowledge transcode segment completion", "component", "proxy", "error", ackErr, "playback_session_id", claims.SessionID)
 		}
 	}
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
 }
 
 // handleReloadConfig re-reads this proxy's configuration. A proxy's force
