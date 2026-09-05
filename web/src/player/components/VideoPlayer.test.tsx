@@ -24,6 +24,8 @@ const controls = vi.hoisted(() => ({
     subtitleTracks: PlayerSubtitleInfo[];
     visible: boolean;
     onSurfaceTap?: (event: React.MouseEvent<HTMLElement>) => void;
+    isFullscreen?: boolean;
+    onFullscreenToggle?: () => void;
   },
 }));
 const playerSeek = vi.hoisted(() => vi.fn());
@@ -100,6 +102,8 @@ vi.mock("./PlayerControls", () => ({
       subtitleTracks: PlayerSubtitleInfo[];
       visible: boolean;
       onSurfaceTap?: (event: React.MouseEvent<HTMLElement>) => void;
+      isFullscreen?: boolean;
+      onFullscreenToggle?: () => void;
     }) => {
       controls.current = props;
       return null;
@@ -886,7 +890,12 @@ describe("VideoPlayer translation handoff", () => {
   it("selects the refreshed downloaded track and clears the live overlay", async () => {
     const onRefreshSubtitles = vi.fn();
     const onSubtitleChanged = vi.fn();
-    const { rerenderPlayer } = renderPlayer({ onRefreshSubtitles, onSubtitleChanged });
+    const onSubtitleTrackChange = vi.fn();
+    const { rerenderPlayer } = renderPlayer({
+      onRefreshSubtitles,
+      onSubtitleChanged,
+      onSubtitleTrackChange,
+    });
 
     act(() => {
       realtimeOptions.current?.onEvent?.({
@@ -904,6 +913,7 @@ describe("VideoPlayer translation handoff", () => {
         },
       });
     });
+    expect(onSubtitleTrackChange).not.toHaveBeenCalledWith(1_000_000, expect.any(Number));
     expect(controls.current?.activeSubtitleIndex).toBe(1_000_000);
     expect(controls.current?.subtitleTracks.some((track) => track.live)).toBe(true);
 
@@ -924,6 +934,7 @@ describe("VideoPlayer translation handoff", () => {
       });
     });
     expect(onRefreshSubtitles).toHaveBeenCalledOnce();
+    expect(onSubtitleTrackChange).not.toHaveBeenCalledWith(1_000_000, expect.any(Number));
     expect(controls.current?.activeSubtitleIndex).toBe(1_000_000);
 
     const downloadedTrack: PlayerSubtitleInfo = {
@@ -947,7 +958,72 @@ describe("VideoPlayer translation handoff", () => {
     });
 
     await waitFor(() => expect(onSubtitleChanged).toHaveBeenCalledWith(4, undefined));
+    expect(onSubtitleTrackChange).toHaveBeenCalledWith(4, expect.any(Number));
     expect(controls.current?.activeSubtitleIndex).toBe(4);
     expect(controls.current?.subtitleTracks).toEqual([downloadedTrack]);
+  });
+
+  it.each(["missing", "rejecting"])(
+    "falls back to webkitEnterFullscreen when requestFullscreen is %s",
+    async (mode) => {
+      const webkitEnterFullscreen = vi.fn();
+      const webkitExitFullscreen = vi.fn();
+
+      const { container } = renderPlayer();
+
+      const video = container.querySelector("video") as HTMLVideoElement & {
+        webkitSupportsFullscreen?: boolean;
+        webkitDisplayingFullscreen?: boolean;
+        webkitEnterFullscreen?: () => void;
+        webkitExitFullscreen?: () => void;
+      };
+      video.webkitSupportsFullscreen = true;
+      video.webkitEnterFullscreen = webkitEnterFullscreen;
+      video.webkitExitFullscreen = webkitExitFullscreen;
+
+      // Simulate container requestFullscreen rejecting (as WebKit on iPhone does)
+      const playerContainer = container.querySelector(".player-container") as HTMLElement;
+      expect(playerContainer).not.toBeNull();
+      const requestFullscreen = vi.fn().mockRejectedValue(new Error("Not supported"));
+      Object.defineProperty(playerContainer, "requestFullscreen", {
+        value: mode === "rejecting" ? requestFullscreen : undefined,
+        configurable: true,
+      });
+
+      act(() => {
+        controls.current?.onFullscreenToggle?.();
+      });
+
+      await waitFor(() => expect(webkitEnterFullscreen).toHaveBeenCalledOnce());
+      expect(requestFullscreen).toHaveBeenCalledTimes(mode === "rejecting" ? 1 : 0);
+
+      video.webkitDisplayingFullscreen = true;
+      act(() => {
+        controls.current?.onFullscreenToggle?.();
+      });
+      expect(webkitExitFullscreen).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("tracks WebKit fullscreen events on the video element", async () => {
+    const { container } = renderPlayer();
+
+    const video = container.querySelector("video") as HTMLVideoElement & {
+      webkitDisplayingFullscreen?: boolean;
+    };
+
+    video.webkitDisplayingFullscreen = true;
+    act(() => {
+      video.dispatchEvent(new Event("webkitbeginfullscreen"));
+    });
+
+    expect(controls.current?.isFullscreen).toBe(true);
+
+    video.webkitDisplayingFullscreen = false;
+    act(() => {
+      video.dispatchEvent(new Event("webkitendfullscreen"));
+    });
+
+    expect(controls.current?.isFullscreen).toBe(false);
   });
 });
