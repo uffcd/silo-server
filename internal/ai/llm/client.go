@@ -34,6 +34,10 @@ type Config struct {
 	ASRModel   string // audio-transcription model, e.g. "whisper-1"
 }
 
+// ErrQuotaExhausted means the provider requires a billing or quota change;
+// waiting and retrying the same request cannot recover it.
+var ErrQuotaExhausted = errors.New("AI provider credit or spending limit is exhausted")
+
 func (c Config) asrBaseURL() string {
 	if c.ASRBaseURL != "" {
 		return c.ASRBaseURL
@@ -211,7 +215,7 @@ func (c *Client) doWithRetry(ctx context.Context, httpClient *http.Client, label
 		if doErr != nil {
 			lastErr = fmt.Errorf("%s request failed: %w", label, doErr)
 			if waitErr := sleepCtx(ctx, time.Duration(attempt+1)*time.Second); waitErr != nil {
-				return waitErr
+				return errors.Join(lastErr, waitErr)
 			}
 			continue
 		}
@@ -223,24 +227,27 @@ func (c *Client) doWithRetry(ctx context.Context, httpClient *http.Client, label
 			// (empty) response; treat it as a retryable transport error.
 			lastErr = fmt.Errorf("read %s response: %w", label, readErr)
 			if waitErr := sleepCtx(ctx, time.Duration(attempt+1)*time.Second); waitErr != nil {
-				return waitErr
+				return errors.Join(lastErr, waitErr)
 			}
 			continue
 		}
 
 		switch {
 		case resp.StatusCode == http.StatusTooManyRequests:
+			if isExhaustedQuota(respBody) {
+				return fmt.Errorf("%w: %s returned 429: %s", ErrQuotaExhausted, label, Truncate(string(respBody), 300))
+			}
 			wait := rateLimitBackoff(resp, attempt)
 			slog.WarnContext(ctx, "rate limited by AI API, waiting", "component", "ai", "api", label, "attempt", attempt+1, "wait", wait)
 			lastErr = fmt.Errorf("%s returned 429: %s", label, Truncate(string(respBody), 300))
 			if waitErr := sleepCtx(ctx, wait); waitErr != nil {
-				return waitErr
+				return errors.Join(lastErr, waitErr)
 			}
 			continue
 		case resp.StatusCode >= 500:
 			lastErr = fmt.Errorf("%s returned %d: %s", label, resp.StatusCode, Truncate(string(respBody), 300))
 			if waitErr := sleepCtx(ctx, time.Duration(attempt+1)*time.Second); waitErr != nil {
-				return waitErr
+				return errors.Join(lastErr, waitErr)
 			}
 			continue
 		case resp.StatusCode != http.StatusOK:
@@ -252,13 +259,12 @@ func (c *Client) doWithRetry(ctx context.Context, httpClient *http.Client, label
 		if parseErr == nil {
 			return nil
 		}
-		var perm *permanentError
-		if errors.As(parseErr, &perm) {
+		if perm, ok := errors.AsType[*permanentError](parseErr); ok {
 			return perm.err
 		}
 		lastErr = parseErr
 		if waitErr := sleepCtx(ctx, time.Duration(attempt+1)*time.Second); waitErr != nil {
-			return waitErr
+			return errors.Join(lastErr, waitErr)
 		}
 	}
 
@@ -266,6 +272,29 @@ func (c *Client) doWithRetry(ctx context.Context, httpClient *http.Client, label
 		lastErr = fmt.Errorf("%s: retries exhausted", label)
 	}
 	return lastErr
+}
+
+func isExhaustedQuota(body []byte) bool {
+	var response struct {
+		Error struct {
+			Type string          `json:"type"`
+			Code json.RawMessage `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &response) != nil {
+		return false
+	}
+	var code string
+	_ = json.Unmarshal(response.Error.Code, &code)
+	if response.Error.Type == "insufficient_quota" {
+		return true
+	}
+	switch code {
+	case "insufficient_quota", "credit_balance_exhausted", "organization_spend_limit_exceeded", "billing_hard_limit_reached":
+		return true
+	default:
+		return false
+	}
 }
 
 // endpointURL joins a configured base URL with an OpenAI API path,

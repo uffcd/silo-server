@@ -68,15 +68,16 @@ func (a *redisSettingsCheckAdapter) Ping(ctx context.Context) error {
 }
 
 func (a *redisSettingsCheckAdapter) Close() error {
-	return a.client.Close()
+	return cache.CloseRedisClient(a.client)
 }
 
 var newAdminS3SettingsCheckClient = func(cfg s3client.BucketConfig) s3SettingsCheckClient {
+	cfg.Role = "checks"
 	return s3client.NewClient(cfg)
 }
 
 var newAdminRedisSettingsCheckClient = func(cfg config.RedisConfig) (redisSettingsCheckClient, error) {
-	client, err := cache.NewRedisClient(cfg)
+	client, err := cache.NewRedisClientForRole(cfg, "checks")
 	if err != nil {
 		return nil, err
 	}
@@ -133,30 +134,38 @@ func (h *AdminHandler) HandleCheckSettingsConnection(w http.ResponseWriter, r *h
 		return
 	}
 
-	var response connectionCheckResponse
-	switch kind {
-	case "s3_public", "s3_operational":
-		response = checkS3PublicConnection(r.Context(), cfg)
-	case "s3_private":
-		response = checkS3PrivateConnection(r.Context(), cfg)
-	case "redis":
-		response = checkRedisConnection(r.Context(), cfg)
-	case "recommendations_embedding":
-		response = checkRecommendationsEmbeddingConnection(r.Context(), cfg)
-	case "ai_chat":
-		response = checkAIChatConnection(r.Context(), cfg)
-	case "ai_transcription":
-		response = checkAITranscriptionConnection(r.Context(), cfg)
-	case "meilisearch":
-		response = checkMeilisearchConnection(r.Context(), effectiveSettings)
-	case "mdblist":
-		response = checkMDBListConnection(r.Context(), cfg)
-	default:
+	response, err := runAdminSettingsConnectionCheck(r.Context(), kind, cfg, effectiveSettings)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "Unsupported connection check kind")
 		return
 	}
-
 	writeJSON(w, http.StatusOK, response)
+}
+
+func runAdminSettingsConnectionCheck(ctx context.Context, kind string, cfg *config.Config, effectiveSettings map[string]string) (connectionCheckResponse, error) {
+	var response connectionCheckResponse
+	switch kind {
+	case "s3_public", "s3_operational":
+		response = checkS3PublicConnection(ctx, cfg)
+	case "s3_private":
+		response = checkS3PrivateConnection(ctx, cfg)
+	case "redis":
+		response = checkRedisConnection(ctx, cfg)
+	case "recommendations_embedding":
+		response = checkRecommendationsEmbeddingConnection(ctx, cfg)
+	case "ai_chat":
+		response = checkAIChatConnection(ctx, cfg)
+	case "ai_transcription":
+		response = checkAITranscriptionConnection(ctx, cfg)
+	case "meilisearch":
+		response = checkMeilisearchConnection(ctx, effectiveSettings)
+	case "mdblist":
+		response = checkMDBListConnection(ctx, cfg)
+	default:
+		return connectionCheckResponse{}, ErrAdminSettingsCheckKind
+	}
+
+	return response, nil
 }
 
 func checkMDBListConnection(ctx context.Context, cfg *config.Config) connectionCheckResponse {

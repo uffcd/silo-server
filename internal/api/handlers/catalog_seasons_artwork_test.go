@@ -13,6 +13,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/imagesize"
 	"github.com/Silo-Server/silo-server/internal/metadata"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/scanner"
@@ -124,6 +125,36 @@ func TestSeasonListArtworkHTTP(t *testing.T) {
 					}
 					result.Seasons[i].PosterURL = ""
 					result.Seasons[i].PosterThumbhash = ""
+				}
+				// The typed v2 seam must use the same artwork switch as the HTTP handler.
+				storage.signs = 0
+				// Use a fresh resolver so the HTTP request's signature cache cannot mask work.
+				typedResolver := metadata.NewPluginImageResolver()
+				t.Cleanup(typedResolver.Close)
+				typedResolver.SetS3Presigner(storage, time.Hour)
+				typedResolver.SetArtworkAvailabilityReader(metadata.NewArtworkDeliveryStore(pool, "test", true))
+				svc.SetImageResolver(typedResolver)
+				viewer := ItemViewer{Access: catalog.AccessFilter{ImageSize: imagesize.Size(size)}}
+				typed, err := NewCatalogResourceHandler(items).SeriesSeasons(ctx, viewer, prefix, include == "true")
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantSigns := 0
+				if include == "true" {
+					wantSigns = 37
+				}
+				if storage.signs != wantSigns {
+					t.Fatalf("typed seam signed %d posters, want %d", storage.signs, wantSigns)
+				}
+				for i := range typed {
+					if include == "false" && (typed[i].PosterURL != "" || typed[i].PosterThumbhash != "") {
+						t.Fatal("typed seam retained artwork")
+					}
+					typed[i].PosterURL = ""
+					typed[i].PosterThumbhash = ""
+				}
+				if !reflect.DeepEqual(result.Seasons, typed) {
+					t.Fatal("typed seam changed non-artwork metadata")
 				}
 				if baseline == nil {
 					baseline = result.Seasons

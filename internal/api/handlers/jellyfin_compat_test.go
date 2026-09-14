@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -382,5 +383,51 @@ func waitForWebOperation(t *testing.T, root string) {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// The v2 seam shares the bridge's install path. A pinned install starts the
+// local operation and answers it; a second install on the same root while it
+// runs reports the running operation with the active-operation error so the v2
+// listener can coalesce; a remove during that install is the same error with
+// the running install, which the listener renders as a conflict.
+func TestStartAdminJellyfinCompatWebSeamReportsRunningOperation(t *testing.T) {
+	cfg, err := config.LoadFromDB(map[string]string{})
+	if err != nil {
+		t.Fatalf("LoadFromDB: %v", err)
+	}
+	root := asyncWebInstallRoot(t)
+	settings := &fakeServerSettingsStore{values: map[string]string{
+		"jellyfin_compat.enabled":         "true",
+		"jellyfin_compat.web_install_dir": root,
+	}}
+	handler := &AdminHandler{Config: cfg, SettingsRepo: settings}
+	ctx := context.Background()
+	status, err := handler.StartAdminJellyfinCompatWebRemove(ctx)
+	if err != nil || status.Operation == nil || status.Operation.Kind != jellycompat.WebComponentOperationRemove {
+		t.Fatalf("remove: %+v %v", status.Operation, err)
+	}
+	if settings.values["jellyfin_compat.web_enabled"] != "false" {
+		t.Fatalf("web_enabled = %q", settings.values["jellyfin_compat.web_enabled"])
+	}
+	// While the removal runs, another removal reports it and an install conflicts with it.
+	if op := jellycompat.CurrentWebOperation(root); op != nil && op.State == jellycompat.WebComponentOperationRunning {
+		again, err := handler.StartAdminJellyfinCompatWebRemove(ctx)
+		if !errors.Is(err, jellycompat.ErrWebComponentOperationActive) || again.Operation == nil || again.Operation.Kind != jellycompat.WebComponentOperationRemove {
+			t.Fatalf("repeat remove: %+v %v", again.Operation, err)
+		}
+	}
+	waitForWebOperation(t, root)
+	// An install pinned to an unsafe version is refused before any operation starts.
+	if _, err := handler.StartAdminJellyfinCompatWebInstall(ctx, AdminJellyfinWebInstallRequest{Version: "10.11.6;touch-bad"}); err == nil || errors.Is(err, jellycompat.ErrWebComponentOperationActive) {
+		t.Fatalf("unsafe version: %v", err)
+	}
+	if op := jellycompat.CurrentWebOperation(root); op != nil && op.Kind == jellycompat.WebComponentOperationInstall && op.State == jellycompat.WebComponentOperationRunning {
+		t.Fatal("an install started for an unsafe version")
+	}
+	handler.SettingsRepo = nil
+	var apiErr *APIError
+	if _, err := handler.StartAdminJellyfinCompatWebRemove(ctx); !errors.As(err, &apiErr) || apiErr.Status != http.StatusInternalServerError {
+		t.Fatalf("no settings store: %v", err)
 	}
 }

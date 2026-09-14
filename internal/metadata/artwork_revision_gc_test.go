@@ -743,17 +743,18 @@ func TestArtworkRevisionGCFinalGuardRearmsVisibleReference(t *testing.T) {
 
 	var deletedAt *time.Time
 	var nextAttempt time.Time
+	var due bool
 	var lockedBy string
 	if err := pool.QueryRow(ctx, `
-		SELECT deleted_at, next_attempt_at, locked_by
+		SELECT deleted_at, next_attempt_at, next_attempt_at <= NOW(), locked_by
 		FROM artwork_revision_gc_candidates
-		WHERE id = $1`, candidateID).Scan(&deletedAt, &nextAttempt, &lockedBy); err != nil {
+		WHERE id = $1`, candidateID).Scan(&deletedAt, &nextAttempt, &due, &lockedBy); err != nil {
 		t.Fatalf("load guarded candidate: %v", err)
 	}
 	if deletedAt == nil {
 		t.Fatal("guarded candidate lost its durable deleted_at marker")
 	}
-	if nextAttempt.After(time.Now()) {
+	if !due {
 		t.Fatalf("next_attempt_at = %v, want immediate follow-up", nextAttempt)
 	}
 	if lockedBy != "" {
