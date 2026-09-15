@@ -76,6 +76,32 @@ func (h *Handler) handlePlayStart(w http.ResponseWriter, r *http.Request) {
 		// currentTime is already 0 on error path; safe to continue.
 	}
 
+	// Create the progress row on a book's very first play. The session-sync
+	// heartbeat (handleSessionSync) is deliberately UPDATE-only — PR #169
+	// reverted an insert-on-missing there because a background tick arriving
+	// after the user explicitly cleared progress must not resurrect it, and a
+	// tick can't be sure the item's duration is known yet. Neither risk
+	// applies here: play-start is a one-time, explicit "begin listening"
+	// action (not a recurring tick), and the item is already loaded, so the
+	// row is created with its real duration. Without this, a book with no
+	// prior progress never appears in Continue Listening no matter how long
+	// it plays, because every heartbeat after it is a no-op update.
+	if h.deps.ProgressStore != nil {
+		if existing, getErr := h.deps.ProgressStore.GetProgress(r.Context(), a.UserID, a.ProfileID, contentID); getErr == nil && existing == nil {
+			if err := h.deps.ProgressStore.UpsertProgress(r.Context(), ProgressRow{
+				UserID:          a.UserID,
+				ProfileID:       a.ProfileID,
+				ContentID:       contentID,
+				CurrentSeconds:  currentTime,
+				DurationSeconds: audiobookDurationSeconds(item),
+				UpdatedAt:       time.Now(),
+			}); err != nil {
+				slog.WarnContext(r.Context(), "abs play: create initial progress row failed", "component", "audiobooks",
+					"user", a.UserID, "item", contentID, "err", err)
+			}
+		}
+	}
+
 	// The {ino} parameter used by handleFileStream is a 0-based file index, but
 	// we want iOS clients to resolve it via the stable MD5 derivation. Emit inos
 	// that handleFileStream can reverse without a database lookup.

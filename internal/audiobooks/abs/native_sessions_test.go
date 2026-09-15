@@ -187,6 +187,198 @@ func TestHandleSessionSyncUpdatesNativePlaybackSession(t *testing.T) {
 	}
 }
 
+// TestHandlePlayStartCreatesProgressRowOnFirstListen guards against a
+// regression where the very first online listen of a book (no existing
+// user_watch_progress row) never got one: the session-sync heartbeat is
+// deliberately UPDATE-only (PR #169 reverted insert-on-missing there, to
+// stop a stray background tick from resurrecting progress the user
+// explicitly cleared), so nothing else in the online path created the row —
+// the book never surfaced in Continue Listening no matter how long it played.
+// Play-start is the right place: it is a one-time, explicit action, not a
+// recurring tick, so the resurrection risk the heartbeat guards against
+// doesn't apply here.
+func TestHandlePlayStartCreatesProgressRowOnFirstListen(t *testing.T) {
+	media := &playStartMediaStore{
+		item:  &models.MediaItem{ContentID: "book-1", Type: "audiobook", Title: "Book", UpdatedAt: time.Now(), Runtime: 600},
+		files: []*models.MediaFile{{ID: 42, ContentID: "book-1", FilePath: "/tmp/book.mp3", Duration: 3600}},
+	}
+	progress := &fakeProgressStore{} // row == nil: no progress row exists yet
+	h := New(Dependencies{
+		MediaStore:           media,
+		ProgressStore:        progress,
+		PlaybackSessionStore: &fakePlaybackSessionStore{},
+		NativeSessions:       playback.NewSessionManager(0, 0),
+		NativeSessionSyncer:  &recordingPlaybackSessionSyncer{},
+	})
+
+	rec := dispatchABSWithParams(
+		http.MethodPost,
+		"/api/items/book-1/play",
+		map[string]string{"libraryItemId": "book-1"},
+		nil,
+		"1",
+		"profile-1",
+		h.handlePlayStart,
+	)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if progress.upsertCalls != 1 {
+		t.Fatalf("upsertCalls = %d, want 1 (row should be created on first play)", progress.upsertCalls)
+	}
+	if progress.lastUpsert.ContentID != "book-1" || progress.lastUpsert.CurrentSeconds != 0 {
+		t.Fatalf("unexpected upsert row: %+v", progress.lastUpsert)
+	}
+	if progress.lastUpsert.DurationSeconds <= 0 {
+		t.Fatalf("upsert row has no duration: %+v", progress.lastUpsert)
+	}
+}
+
+// TestHandlePlayStartLeavesExistingProgressRowAlone guards the other half of
+// the same fix: resuming a book that already has a progress row must not
+// touch it via play-start (no accidental reset of position or duration) — the
+// heartbeat's own monotonic update remains the only writer from then on.
+func TestHandlePlayStartLeavesExistingProgressRowAlone(t *testing.T) {
+	media := &playStartMediaStore{
+		item:  &models.MediaItem{ContentID: "book-1", Type: "audiobook", Title: "Book", UpdatedAt: time.Now(), Runtime: 600},
+		files: []*models.MediaFile{{ID: 42, ContentID: "book-1", FilePath: "/tmp/book.mp3", Duration: 3600}},
+	}
+	progress := &fakeProgressStore{row: &ProgressRow{
+		UserID: "1", ProfileID: "profile-1", ContentID: "book-1", CurrentSeconds: 123.5, DurationSeconds: 3600,
+	}}
+	h := New(Dependencies{
+		MediaStore:           media,
+		ProgressStore:        progress,
+		PlaybackSessionStore: &fakePlaybackSessionStore{},
+		NativeSessions:       playback.NewSessionManager(0, 0),
+		NativeSessionSyncer:  &recordingPlaybackSessionSyncer{},
+	})
+
+	rec := dispatchABSWithParams(
+		http.MethodPost,
+		"/api/items/book-1/play",
+		map[string]string{"libraryItemId": "book-1"},
+		nil,
+		"1",
+		"profile-1",
+		h.handlePlayStart,
+	)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if progress.upsertCalls != 0 {
+		t.Fatalf("upsertCalls = %d, want 0 (an existing row must not be overwritten by play-start)", progress.upsertCalls)
+	}
+}
+
+// TestHandleSessionSyncCreatesProgressRowOnFirstOnlineListen covers the case
+// handlePlayStart's own fix can't reach: a client (observed: the ABS iOS app)
+// that keeps heartbeating an existing, still-open session across a server
+// restart without ever calling /play again. Every tick that reaches this
+// handler already passed an open-session lookup, so creating the row here is
+// trustworthy -- it reflects genuinely active playback, not a stray tick.
+func TestHandleSessionSyncCreatesProgressRowOnFirstOnlineListen(t *testing.T) {
+	media := &playStartMediaStore{
+		item: &models.MediaItem{ContentID: "book-1", Type: "audiobook", Title: "Book", UpdatedAt: time.Now(), Runtime: 600},
+	}
+	absSessions := &fakePlaybackSessionStore{}
+	nativeSessions := playback.NewSessionManager(0, 0)
+	native, err := nativeSessions.StartSessionWithFilesContext(context.Background(), 1, "profile-1", 42, 42, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("start native session: %v", err)
+	}
+	_ = absSessions.InsertPlaybackSession(context.Background(), ABSPlaybackSession{
+		ID:        native.ID,
+		UserID:    "1",
+		ProfileID: "profile-1",
+		ContentID: "book-1",
+	})
+	progress := &fakeProgressStore{} // row == nil: no progress row exists yet
+	h := New(Dependencies{
+		MediaStore:           media,
+		ProgressStore:        progress,
+		PlaybackSessionStore: absSessions,
+		NativeSessions:       nativeSessions,
+		NativeSessionSyncer:  &recordingPlaybackSessionSyncer{},
+	})
+
+	rec := dispatchABSWithParams(
+		http.MethodPatch,
+		"/api/session/"+native.ID,
+		map[string]string{"sid": native.ID},
+		[]byte(`{"currentTime":55.25,"timeListening":10}`),
+		"1",
+		"profile-1",
+		h.handleSessionSync,
+	)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if progress.upsertCalls != 1 {
+		t.Fatalf("upsertCalls = %d, want 1 (row should be created on first sync)", progress.upsertCalls)
+	}
+	if progress.updateCalls != 0 {
+		t.Fatalf("updateCalls = %d, want 0 (UpdateProgressPosition is a no-op with no existing row)", progress.updateCalls)
+	}
+	if progress.lastUpsert.ContentID != "book-1" || progress.lastUpsert.CurrentSeconds != 55.25 {
+		t.Fatalf("unexpected upsert row: %+v", progress.lastUpsert)
+	}
+	if progress.lastUpsert.DurationSeconds <= 0 {
+		t.Fatalf("upsert row has no duration: %+v", progress.lastUpsert)
+	}
+}
+
+// TestHandleSessionSyncUpdatesExistingProgressRow guards the other half of the
+// same fix: once a row exists, the sync heartbeat must keep using
+// UpdateProgressPosition (not a full upsert), so it can't un-finish a book or
+// overwrite a progress_pct the user set explicitly.
+func TestHandleSessionSyncUpdatesExistingProgressRow(t *testing.T) {
+	media := &playStartMediaStore{
+		item: &models.MediaItem{ContentID: "book-1", Type: "audiobook", Title: "Book", UpdatedAt: time.Now(), Runtime: 600},
+	}
+	absSessions := &fakePlaybackSessionStore{}
+	nativeSessions := playback.NewSessionManager(0, 0)
+	native, err := nativeSessions.StartSessionWithFilesContext(context.Background(), 1, "profile-1", 42, 42, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("start native session: %v", err)
+	}
+	_ = absSessions.InsertPlaybackSession(context.Background(), ABSPlaybackSession{
+		ID:        native.ID,
+		UserID:    "1",
+		ProfileID: "profile-1",
+		ContentID: "book-1",
+	})
+	progress := &fakeProgressStore{row: &ProgressRow{
+		UserID: "1", ProfileID: "profile-1", ContentID: "book-1", CurrentSeconds: 10,
+	}}
+	h := New(Dependencies{
+		MediaStore:           media,
+		ProgressStore:        progress,
+		PlaybackSessionStore: absSessions,
+		NativeSessions:       nativeSessions,
+		NativeSessionSyncer:  &recordingPlaybackSessionSyncer{},
+	})
+
+	rec := dispatchABSWithParams(
+		http.MethodPatch,
+		"/api/session/"+native.ID,
+		map[string]string{"sid": native.ID},
+		[]byte(`{"currentTime":55.25,"timeListening":10}`),
+		"1",
+		"profile-1",
+		h.handleSessionSync,
+	)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if progress.updateCalls != 1 {
+		t.Fatalf("updateCalls = %d, want 1", progress.updateCalls)
+	}
+	if progress.upsertCalls != 0 {
+		t.Fatalf("upsertCalls = %d, want 0 (an existing row must not go through a full upsert)", progress.upsertCalls)
+	}
+}
+
 func TestHandleSessionCloseStopsNativePlaybackSession(t *testing.T) {
 	absSessions := &fakePlaybackSessionStore{}
 	nativeSessions := playback.NewSessionManager(0, 0)

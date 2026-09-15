@@ -368,12 +368,36 @@ func (h *Handler) handleSessionSync(w http.ResponseWriter, r *http.Request) {
 
 	// Update position in user_watch_progress. Must NOT be a full upsert —
 	// see comment in handleSetItemProgress re: not overwriting is_finished.
+	//
+	// handlePlayStart creates the row for a genuinely fresh session, but real
+	// clients (observed: the ABS iOS app) can keep heartbeating an existing,
+	// still-open session across a server restart without ever calling /play
+	// again -- so play-start alone leaves a real gap. Every tick that reaches
+	// here already passed GetPlaybackSession, i.e. it belongs to a session
+	// Postgres still has open (not closed, not a replay of a finished one), so
+	// creating the row here is trustworthy: it reflects genuinely active
+	// playback, not a stray/delayed request. Populate the item's real
+	// duration up front so the row is never a bare zero-duration stub.
 	if h.deps.ProgressStore != nil {
-		if err := h.deps.ProgressStore.UpdateProgressPosition(
-			r.Context(), a.UserID, a.ProfileID, sess.ContentID, p.CurrentTime,
-		); err != nil {
+		existing, getErr := h.deps.ProgressStore.GetProgress(r.Context(), a.UserID, a.ProfileID, sess.ContentID)
+		var syncErr error
+		if getErr == nil && existing == nil {
+			syncErr = h.deps.ProgressStore.UpsertProgress(r.Context(), ProgressRow{
+				UserID:          a.UserID,
+				ProfileID:       a.ProfileID,
+				ContentID:       sess.ContentID,
+				CurrentSeconds:  p.CurrentTime,
+				DurationSeconds: audiobookDurationSeconds(item),
+				UpdatedAt:       time.Now(),
+			})
+		} else {
+			syncErr = h.deps.ProgressStore.UpdateProgressPosition(
+				r.Context(), a.UserID, a.ProfileID, sess.ContentID, p.CurrentTime,
+			)
+		}
+		if syncErr != nil {
 			slog.WarnContext(r.Context(), "abs session sync: update progress position failed", "component", "audiobooks",
-				"session_id", sid, "content_id", sess.ContentID, "error", err)
+				"session_id", sid, "content_id", sess.ContentID, "error", syncErr)
 		}
 	}
 	h.updateNativePlaybackProgress(r.Context(), sid, p.CurrentTime)

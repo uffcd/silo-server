@@ -14,6 +14,13 @@ type fakeProgressStore struct {
 	row    *ProgressRow
 	getErr error
 	called bool
+
+	// Call recording for tests that assert which write path was taken
+	// (UpsertProgress vs. UpdateProgressPosition) rather than only whether
+	// GetProgress was consulted.
+	upsertCalls int
+	lastUpsert  ProgressRow
+	updateCalls int
 }
 
 func (f *fakeProgressStore) GetProgress(_ context.Context, _, _, _ string) (*ProgressRow, error) {
@@ -23,8 +30,13 @@ func (f *fakeProgressStore) GetProgress(_ context.Context, _, _, _ string) (*Pro
 func (f *fakeProgressStore) ListProgressForAudiobooks(_ context.Context, _, _ string, _ int) ([]ProgressRow, error) {
 	return nil, nil
 }
-func (f *fakeProgressStore) UpsertProgress(_ context.Context, _ ProgressRow) error { return nil }
+func (f *fakeProgressStore) UpsertProgress(_ context.Context, row ProgressRow) error {
+	f.upsertCalls++
+	f.lastUpsert = row
+	return nil
+}
 func (f *fakeProgressStore) UpdateProgressPosition(_ context.Context, _, _, _ string, _ float64) error {
+	f.updateCalls++
 	return nil
 }
 func (f *fakeProgressStore) SetHideFromContinue(_ context.Context, _, _, _ string, _ bool) error {
